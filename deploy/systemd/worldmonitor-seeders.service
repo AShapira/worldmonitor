@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh World Monitor local seed data
+Requires=worldmonitor-podman.service
+After=worldmonitor-podman.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/worldmonitor
+ExecStart=%h/dev/worldmonitor/scripts/podman-local.sh seed
+TimeoutStartSec=2h

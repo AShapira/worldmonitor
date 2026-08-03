@@ -383,7 +383,14 @@ const LLM_PROVIDERS = [
       if (apiKey) h.Authorization = `Bearer ${apiKey}`;
       return h;
     },
-    extraBody: { think: false },
+    // Qwen 3 on Ollama's OpenAI-compatible route can otherwise spend the
+    // entire completion budget in reasoning and return an empty `content`.
+    // Keep `think: false` for native Ollama compatibility and also send the
+    // OpenAI-compatible control used by the main World Monitor LLM adapter.
+    extraBody: {
+      think: false,
+      reasoning_effort: process.env.LLM_REASONING_EFFORT || 'none',
+    },
     timeout: 25_000,
   },
   {

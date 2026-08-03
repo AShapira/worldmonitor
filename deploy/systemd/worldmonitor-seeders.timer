@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the full World Monitor local seed set daily
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+AccuracySec=1min
+Persistent=true
+Unit=worldmonitor-seeders.service
+
+[Install]
+WantedBy=timers.target

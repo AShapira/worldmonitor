@@ -12,6 +12,17 @@ FROM node:24-alpine@sha256:a0b9bf06e4e6193cf7a0f58816cc935ff8c2a908f81e6f1a95432
 
 WORKDIR /app
 
+# Public, build-time UI configuration. Secrets must never be passed as build
+# args because they become part of the image history.
+ARG VITE_VARIANT=full
+ARG VITE_MAP_INTERACTION_MODE=3d
+ARG VITE_PMTILES_URL=
+ARG VITE_LOCAL_OPERATOR_MODE=0
+ENV VITE_VARIANT=${VITE_VARIANT} \
+    VITE_MAP_INTERACTION_MODE=${VITE_MAP_INTERACTION_MODE} \
+    VITE_PMTILES_URL=${VITE_PMTILES_URL} \
+    VITE_LOCAL_OPERATOR_MODE=${VITE_LOCAL_OPERATOR_MODE}
+
 # Install root dependencies (layer-cached until package.json changes)
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts

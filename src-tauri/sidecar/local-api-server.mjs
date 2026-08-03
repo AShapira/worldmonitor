@@ -1904,6 +1904,23 @@ export async function createLocalApiServer(options = {}) {
           );
         }
       }
+      // Docker self-host ONLY: local LLM endpoints are deliberately private
+      // service origins on the Compose network. Treat only the explicitly
+      // configured origins as trusted; otherwise the global SSRF guard blocks
+      // real handler calls after the startup health probe succeeds.
+      if (context.mode === 'docker') {
+        for (const envKey of ['OLLAMA_API_URL', 'LLM_API_URL']) {
+          const configuredUrl = process.env[envKey];
+          if (!configuredUrl) continue;
+          try {
+            extraAllowedPrivateOrigins.push(new URL(configuredUrl).origin);
+          } catch (err) {
+            context.logger.warn(
+              `[local-api] ${envKey} is not a valid URL; not added to the private-fetch allowlist: ${err.message}`,
+            );
+          }
+        }
+      }
       if (context.allowPrivateRemoteBase) {
         try { extraAllowedPrivateOrigins.push(new URL(context.remoteBase).origin); } catch {}
       }

@@ -4,6 +4,43 @@
 
 **Real-time global intelligence dashboard** — AI-powered news aggregation, geopolitical monitoring, and infrastructure tracking in a unified situational awareness interface.
 
+> **RHEL Podman local edition:** This repository adds a rootless Podman
+> deployment for RHEL, GPU-backed local inference with Ollama, backend-only
+> local operator authentication, persistent Redis/model storage, and user-level
+> systemd lifecycle automation. It is based on
+> [`koala73/worldmonitor`](https://github.com/koala73/worldmonitor) commit
+> `ab798e6284544e42749a3b62be73c0044dfa5f9d`.
+
+## RHEL Podman Quick Start
+
+Requirements:
+
+- RHEL with rootless Podman, `crun`, and `podman-compose`
+- Node.js 22 and npm for host-side seeders and validation
+- NVIDIA Container Toolkit/CDI for GPU inference
+- An NVIDIA GPU with enough VRAM for the selected Ollama model
+
+```bash
+git clone https://github.com/AShapira/worldmonitor.git
+cd worldmonitor
+npm ci
+./scripts/podman-local.sh deploy
+./scripts/podman-local.sh install-systemd
+systemctl --user enable --now worldmonitor-podman.service worldmonitor-seeders.timer
+```
+
+Open <http://127.0.0.1:3000>. The default model is `qwen3:14b`; both native
+Ollama and OpenAI-compatible World Monitor routes remain local. Generated
+secrets are stored only in the ignored, mode-`0600` `.env` file. The dashboard,
+Ollama, and Redis REST proxy bind to loopback; Redis and the AIS relay remain
+container-internal.
+
+See [RHEL_PODMAN.md](RHEL_PODMAN.md) for hardware sizing, configuration,
+optional data-source credentials, operations, validation, backup, LAN-exposure
+requirements, and AGPL network-use considerations.
+
+---
+
 [![GitHub stars](https://img.shields.io/github/stars/koala73/worldmonitor?style=social)](https://github.com/koala73/worldmonitor/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/re63kWKxaz)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)

@@ -1,0 +1,16 @@
+[Unit]
+Description=World Monitor rootless Podman stack with local Ollama
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/dev/worldmonitor
+ExecStart=%h/dev/worldmonitor/scripts/podman-local.sh up
+ExecStop=%h/dev/worldmonitor/scripts/podman-local.sh down
+TimeoutStartSec=15min
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=default.target

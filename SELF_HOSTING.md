@@ -2,6 +2,9 @@
 
 Run the full World Monitor stack locally with Docker/Podman.
 
+For a rootless RHEL deployment with NVIDIA GPU acceleration and a local Ollama
+model, use the dedicated [RHEL Podman guide](RHEL_PODMAN.md).
+
 ## 📋 Prerequisites
 
 - **Docker** or **Podman** (rootless works fine)

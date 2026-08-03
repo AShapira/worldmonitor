@@ -1,0 +1,69 @@
+# RHEL/rootless-Podman overlay for a local, GPU-backed Ollama provider.
+# Keep secrets and host-side endpoint values in the ignored .env file.
+
+services:
+  worldmonitor:
+    build:
+      args:
+        VITE_VARIANT: "${VITE_VARIANT:-full}"
+        VITE_MAP_INTERACTION_MODE: "${VITE_MAP_INTERACTION_MODE:-3d}"
+        VITE_PMTILES_URL: "${VITE_PMTILES_URL:-}"
+        VITE_LOCAL_OPERATOR_MODE: "1"
+    environment:
+      RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?RELAY_SHARED_SECRET required}"
+      # Operator-issued local key for authenticated/premium API handlers. The
+      # value lives only in the ignored .env file and is never baked into the UI.
+      WORLDMONITOR_API_KEY: "${WORLDMONITOR_API_KEY:?WORLDMONITOR_API_KEY required}"
+      WORLDMONITOR_VALID_KEYS: "${WORLDMONITOR_VALID_KEYS:?WORLDMONITOR_VALID_KEYS required}"
+      WORLDMONITOR_RELAY_KEY: "${WORLDMONITOR_RELAY_KEY:?WORLDMONITOR_RELAY_KEY required}"
+      # Native Ollama is first in the normal provider chain.
+      OLLAMA_API_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:14b}"
+      # The generic route covers handlers that explicitly omit the native
+      # Ollama provider (notably stock analysis). Ollama ignores the API key.
+      LLM_API_URL: "http://ollama:11434/v1/chat/completions"
+      LLM_API_KEY: "${LLM_API_KEY:-ollama}"
+      LLM_MODEL: "${LLM_MODEL:-qwen3:14b}"
+      LLM_REASONING_EFFORT: "${LLM_REASONING_EFFORT:-none}"
+      YAHOO_USER_AGENT: "${YAHOO_USER_AGENT:-worldmonitor-local/1.0}"
+      GROQ_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+    depends_on:
+      ollama:
+        condition: service_started
+
+  ais-relay:
+    environment:
+      RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?RELAY_SHARED_SECRET required}"
+      WORLDMONITOR_RELAY_KEY: "${WORLDMONITOR_RELAY_KEY:?WORLDMONITOR_RELAY_KEY required}"
+      OLLAMA_API_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:14b}"
+      LLM_REASONING_EFFORT: "${LLM_REASONING_EFFORT:-none}"
+      GROQ_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+    depends_on:
+      ollama:
+        condition: service_started
+
+  ollama:
+    image: "docker.io/ollama/ollama@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131"
+    container_name: worldmonitor-ollama
+    devices:
+      - "nvidia.com/gpu=all"
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+      OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-2}"
+      OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-1}"
+      OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-24h}"
+      OLLAMA_FLASH_ATTENTION: "${OLLAMA_FLASH_ATTENTION:-1}"
+      OLLAMA_KV_CACHE_TYPE: "${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+      OLLAMA_NO_CLOUD: "1"
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama-data:

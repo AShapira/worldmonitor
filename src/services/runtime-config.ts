@@ -365,7 +365,12 @@ const listeners = new Set<() => void>();
 
 const runtimeConfig: RuntimeConfig = {
   featureToggles: readStoredToggles(),
-  secrets: {},
+  // The Docker deployment keeps the operator key in nginx and injects it
+  // server-side. Expose presence only so local premium panels unlock without
+  // placing the key in the Vite bundle or renderer memory.
+  secrets: import.meta.env.VITE_LOCAL_OPERATOR_MODE === '1'
+    ? { WORLDMONITOR_API_KEY: { source: 'vault' } }
+    : {},
 };
 
 function notifyConfigChanged(): void {

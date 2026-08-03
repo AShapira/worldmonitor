@@ -253,7 +253,7 @@ describe('crawlable content corpus deployment contracts', () => {
         .filter((line) => line && !line.startsWith('#'))
     );
 
-    for (const path of ['docker-compose.override.yml', 'secrets/']) {
+    for (const path of ['.env', '.env.*', 'docker-compose.override.yml', 'secrets/']) {
       assert.ok(ignoreRules.has(path), `${path} must never enter Docker build contexts or caches`);
     }
   });

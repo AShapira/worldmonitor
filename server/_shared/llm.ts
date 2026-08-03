@@ -83,7 +83,10 @@ export function getProviderCredentials(
       apiUrl: new URL('/v1/chat/completions', baseUrl).toString(),
       model: overrides.model || process.env.OLLAMA_MODEL || 'llama3.1:8b',
       headers,
-      extraBody: { think: false },
+      // Recent Ollama releases expose both controls. `reasoning_effort` is
+      // required by the OpenAI-compatible route for Qwen 3; `think` remains
+      // useful for older Ollama/model combinations.
+      extraBody: { think: false, reasoning_effort: 'none' },
     };
   }
 
@@ -129,6 +132,7 @@ export function getProviderCredentials(
     const apiUrl = process.env.LLM_API_URL;
     const apiKey = process.env.LLM_API_KEY;
     if (!apiUrl || !apiKey) return null;
+    const reasoningEffort = process.env.LLM_REASONING_EFFORT?.trim();
     return {
       apiUrl,
       model: overrides.model || process.env.LLM_MODEL || 'gpt-3.5-turbo',
@@ -136,6 +140,7 @@ export function getProviderCredentials(
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
+      extraBody: reasoningEffort ? { reasoning_effort: reasoningEffort } : undefined,
     };
   }
 

@@ -8,6 +8,11 @@ if [ -d /run/secrets ]; then
   for secret_file in /run/secrets/*; do
     [ -f "$secret_file" ] || continue
     key=$(basename "$secret_file")
+    # RHEL container tools mount subscription files such as redhat.repo in
+    # /run/secrets. Only valid shell identifiers can be exported as env vars.
+    case "$key" in
+      ''|[0-9]*|*[!A-Za-z0-9_]*) continue ;;
+    esac
     value=$(cat "$secret_file" | tr -d '\n')
     export "$key"="$value"
   done
@@ -19,5 +24,5 @@ if [ -z "${LOCAL_API_TOKEN:-}" ]; then
   export LOCAL_API_TOKEN
 fi
 
-envsubst '$LOCAL_API_PORT $LOCAL_API_TOKEN' < /etc/nginx/nginx.conf.template > /tmp/nginx.conf
+envsubst '$LOCAL_API_PORT $LOCAL_API_TOKEN $WORLDMONITOR_API_KEY' < /etc/nginx/nginx.conf.template > /tmp/nginx.conf
 exec /usr/bin/supervisord -c /etc/supervisor/conf.d/worldmonitor.conf
