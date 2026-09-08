@@ -3,6 +3,9 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+
+// Workflow fixtures must preserve their mock PATH even when Bash treats a piped
+// stdin as a remote shell and would otherwise source the operator's .bashrc.
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { load as loadYaml } from 'js-yaml';
@@ -57,7 +60,7 @@ function runPreparation({ env = clientEnv, runs = [], apiExit = 0, response = [{
       stepNamed('Dispatch desktop build').run,
       'fi',
     ].join('\n');
-    const result = spawnSync('bash', ['-c', script], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-c', script], {
       encoding: 'utf8',
       env: {
         PATH: `${bin}:${process.env.PATH}`,
@@ -140,7 +143,7 @@ test('direct builds validate client configuration once before matrix expansion a
     [`v${packageVersion}`, true],
     ['v0.0.0', false],
   ]) {
-    const result = spawnSync('bash', ['-e', '-c', target.run], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-c', target.run], {
       cwd: root,
       encoding: 'utf8',
       env: { PATH: process.env.PATH, RELEASE_TAG: releaseTag },
@@ -160,7 +163,7 @@ test('direct builds validate client configuration once before matrix expansion a
     const script = preflight.run
       .replaceAll('${{ github.event_name }}', event)
       .replaceAll('${{ github.event.inputs.draft }}', draft);
-    const result = spawnSync('bash', ['-e', '-c', script], { encoding: 'utf8', env: { PATH: process.env.PATH, ...env } });
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-c', script], { encoding: 'utf8', env: { PATH: process.env.PATH, ...env } });
     assert.equal(result.status === 0, success, result.stdout + result.stderr);
   }
 });
@@ -269,7 +272,7 @@ test('the workflow creates only a compatible main-history tag and dispatches the
 test('every workflow shell block parses after GitHub expression rendering', () => {
   for (const step of steps.filter((candidate) => candidate.run)) {
     const rendered = step.run.replace(/\$\{\{[^}]+\}\}/g, 'main');
-    const result = spawnSync('bash', ['-n'], { input: rendered, encoding: 'utf8' });
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-n'], { input: rendered, encoding: 'utf8' });
     assert.equal(result.status, 0, `${step.name ?? '(unnamed)'}: ${result.stderr}`);
   }
 });

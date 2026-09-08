@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+
+// Workflow fixtures must preserve their mock PATH even when Bash treats a piped
+// stdin as a remote shell and would otherwise source the operator's .bashrc.
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,7 +38,7 @@ esac
     chmodSync(gh, 0o755);
     chmodSync(git, 0o755);
     for (const name of ['output', 'summary', 'calls']) writeFileSync(join(root, name), '');
-    const result = spawnSync('bash', ['-e', '-o', 'pipefail', '-c', step(name).run], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', step(name).run], {
       cwd: root, encoding: 'utf8', timeout: 10_000,
       env: {
         PATH: `${root}:${process.env.PATH}`, RUNNER_TEMP: root,

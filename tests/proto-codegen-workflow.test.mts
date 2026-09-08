@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+
+// Workflow fixtures must preserve their mock PATH even when Bash treats a piped
+// stdin as a remote shell and would otherwise source the operator's .bashrc.
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -123,7 +126,7 @@ function runChangeClassifier(
       { mode: 0o755 },
     );
 
-    const result = spawnSync('bash', ['-euo', 'pipefail', '-c', classifier.run ?? ''], {
+    const result = spawnSync('bash', ['--noprofile', '--norc', '-euo', 'pipefail', '-c', classifier.run ?? ''], {
       cwd: root,
       encoding: 'utf8',
       env: {
@@ -157,7 +160,7 @@ function runChangeClassifier(
 
 function runAggregate(env: Record<string, string>) {
   const aggregate = stepByName('proto-freshness', 'Publish aggregate proto freshness result');
-  return spawnSync('bash', ['-euo', 'pipefail', '-c', aggregate.run ?? ''], {
+  return spawnSync('bash', ['--noprofile', '--norc', '-euo', 'pipefail', '-c', aggregate.run ?? ''], {
     cwd: root,
     encoding: 'utf8',
     env: { ...process.env, ...env },
@@ -199,6 +202,8 @@ type GenerationMode =
 
 function writeNoopMake(fakeBin: string, poisonDir?: string) {
   mkdirSync(fakeBin, { recursive: true });
+  // Generation is mocked; resolve its tool directory without requiring host Go.
+  writeFileSync(join(fakeBin, 'go'), `#!/bin/sh\nset -eu\n[ "$*" = 'env GOPATH' ] || exit 1\nprintf '%s\\n' '${join(fakeBin, 'go-path')}'\n`, { mode: 0o755 });
   const poison = poisonDir
     ? `if [ "\${1:-}" = generate ]; then\n  '${poisonPathFixture}' '${poisonDir}'\nfi\n`
     : '';
@@ -280,7 +285,7 @@ function runGenerationVerdict(
     writeFileSync(join(repo, 'src/components/Unexpected.ts'), 'export const unexpected = true;\n');
   }
 
-  const result = spawnSync('bash', ['-euo', 'pipefail', '-c', verdict.run ?? ''], {
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-euo', 'pipefail', '-c', verdict.run ?? ''], {
     cwd: repo,
     encoding: 'utf8',
     env: {
@@ -343,7 +348,7 @@ function runMergeVerdict(mode: MergeVerdictMode, options: { poison?: boolean } =
     writeFileSync(join(repo, 'src/components/Unexpected.ts'), 'export const unexpected = true;\n');
   }
 
-  const result = spawnSync('bash', ['-euo', 'pipefail', '-c', verdict.run ?? ''], {
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-euo', 'pipefail', '-c', verdict.run ?? ''], {
     cwd: repo,
     encoding: 'utf8',
     env: {
@@ -432,7 +437,7 @@ function runWriter(mode: 'valid' | 'valid-mirror' | 'unexpected' | 'lease-failur
     assert.equal(update.status, 0, update.stderr);
   }
 
-  const result = spawnSync('bash', ['-euo', 'pipefail', '-c', writer.run ?? ''], {
+  const result = spawnSync('bash', ['--noprofile', '--norc', '-euo', 'pipefail', '-c', writer.run ?? ''], {
     cwd: repo,
     encoding: 'utf8',
     env: {
