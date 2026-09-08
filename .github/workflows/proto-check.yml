@@ -253,7 +253,9 @@ jobs:
         run: |
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           export PATH="$(go env GOPATH)/bin:$PATH"
-          make install-buf
+          # Older trusted base Makefiles force GOPROXY=direct internally.
+          # A command-line make variable keeps public dependencies on the proxy.
+          make GO_PROXY='GOPROXY=https://proxy.golang.org,direct' install-buf
         env:
           GOPROXY: 'https://proxy.golang.org,direct'
 
