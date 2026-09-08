@@ -25,6 +25,7 @@ const scorecardMirrorPaths = [
 ].map((match) => match[1]);
 
 type Step = {
+  'working-directory'?: string;
   if?: string;
   name?: string;
   run?: string;
@@ -165,6 +166,41 @@ function runAggregate(env: Record<string, string>) {
     encoding: 'utf8',
     env: { ...process.env, ...env },
   });
+}
+
+function normalizeCompatibilityImage(current: unknown, base: unknown) {
+  const temp = mkdtempSync(join(tmpdir(), 'wm-proto-compat-'));
+  try {
+    writeFileSync(join(temp, 'proto-current.json'), JSON.stringify(current));
+    writeFileSync(join(temp, 'proto-base.json'), JSON.stringify(base));
+    const source = stepByName('proto-breaking', 'Check for breaking proto changes').run ?? '';
+    const python = source.match(/python3 - <<'PY'\n([\s\S]*?)\nPY\n/)?.[1];
+    assert.ok(python, 'compatibility normalization must stay inline in the trusted workflow');
+    const result = spawnSync('python3', ['-c', python], {
+      encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: temp },
+    });
+    return {
+      ...result,
+      image: existsSync(join(temp, 'proto-compat.json'))
+        ? JSON.parse(readFileSync(join(temp, 'proto-compat.json'), 'utf8')) : null,
+    };
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+function compatibilityImage(type: 'TYPE_STRING' | 'TYPE_ENUM') {
+  const source: Record<string, unknown> = { name: 'source', number: 5, type, jsonName: 'source' };
+  if (type === 'TYPE_ENUM') source.typeName = '.worldmonitor.supply_chain.v1.FlowSource';
+  return { file: [{
+    name: 'worldmonitor/supply_chain/v1/supply_chain_data.proto',
+    messageType: [{ name: 'FlowEstimate', field: [source, { name: 'other', number: 6, type: 'TYPE_STRING' }] as Record<string, unknown>[] }],
+    enumType: [{ name: 'FlowSource', value: [
+      { name: 'FLOW_SOURCE_UNSPECIFIED', number: 0 },
+      { name: 'FLOW_SOURCE_PORTWATCH_DWT', number: 1, options: { '[sebuf.http.enum_value]': 'portwatch-dwt' } },
+      { name: 'FLOW_SOURCE_PORTWATCH_COUNTS', number: 2, options: { '[sebuf.http.enum_value]': 'portwatch-counts' } },
+    ] }],
+  }] };
 }
 
 const gitLocalEnvVars = spawnSync('git', ['rev-parse', '--local-env-vars'], {
@@ -711,7 +747,29 @@ describe('proto codegen workflow trust boundaries (#3340)', () => {
 
     const restore = stepByName('proto-breaking', 'Restore the trusted main Makefile').run ?? '';
     assert.equal(restore, 'git show origin/main:Makefile > Makefile');
-    assert.equal(stepByName('proto-breaking', 'Check for breaking proto changes').run, 'make breaking');
+    const compatibility = stepByName('proto-breaking', 'Check for breaking proto changes');
+    assert.equal(compatibility['working-directory'], 'proto');
+    assert.match(compatibility.run ?? '', /buf build '\.\.\/\.git#branch=origin\/main,subdir=proto'/);
+    assert.match(compatibility.run ?? '', /buf breaking "\$RUNNER_TEMP\/proto-compat\.json" --against "\$RUNNER_TEMP\/proto-base\.json"/);
+  });
+
+  it('normalizes only the reviewed legacy JSON source taxonomy while preserving other changes', () => {
+    const base = compatibilityImage('TYPE_STRING');
+    const current = compatibilityImage('TYPE_ENUM');
+    current.file[0]!.messageType[0]!.field[1]!.type = 'TYPE_INT32';
+    const expected = structuredClone(current);
+    expected.file[0]!.messageType[0]!.field[0]!.type = 'TYPE_STRING';
+    delete expected.file[0]!.messageType[0]!.field[0]!.typeName;
+    const result = normalizeCompatibilityImage(current, base);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.image, expected, 'unrelated changes must remain visible to buf breaking');
+    const alreadyMigrated = normalizeCompatibilityImage(current, compatibilityImage('TYPE_ENUM'));
+    assert.equal(alreadyMigrated.status, 0, alreadyMigrated.stderr);
+    assert.deepEqual(alreadyMigrated.image, current, 'an enum baseline gets no legacy exception');
+    Object.assign(current.file[0]!.enumType[0]!.value[1]!, { options: { '[sebuf.http.enum_value]': 'changed-wire-value' } });
+    const changedWire = normalizeCompatibilityImage(current, base);
+    assert.notEqual(changedWire.status, 0);
+    assert.equal(changedWire.image, null);
   });
 
   it('runs trusted-fork generation read-only while keeping the writer internal-only', () => {

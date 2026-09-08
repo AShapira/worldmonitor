@@ -260,7 +260,56 @@ jobs:
           GOPROXY: 'https://proxy.golang.org,direct'
 
       - name: Check for breaking proto changes
-        run: make breaking
+        # Treat PR protos as data, without relying on older base Makefiles'
+        # cwd-relative Git paths or executing any PR-provided recipe.
+        working-directory: proto
+        run: |
+          buf build -o "$RUNNER_TEMP/proto-current.json"
+          buf build '../.git#branch=origin/main,subdir=proto' -o "$RUNNER_TEMP/proto-base.json"
+          # #6101 promoted one string to a sebuf enum whose custom JSON names
+          # preserve the deployed values. This project has JSON-only APIs.
+          # Normalize only that exact transition in the comparison image;
+          # keep the real schema and every other compatibility check intact.
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          current = json.loads((temp / 'proto-current.json').read_text())
+          base = json.loads((temp / 'proto-base.json').read_text())
+
+          def flow_source(image):
+              for file in image['file']:
+                  if file['name'] == 'worldmonitor/supply_chain/v1/supply_chain_data.proto':
+                      for message in file.get('messageType', []):
+                          if message['name'] == 'FlowEstimate':
+                              for field in message.get('field', []):
+                                  if field['name'] == 'source' and field['number'] == 5:
+                                      return file, field
+              return None, None
+
+          current_file, current_field = flow_source(current)
+          _, base_field = flow_source(base)
+          if (base_field and current_field
+                  and base_field['type'] == 'TYPE_STRING'
+                  and current_field['type'] == 'TYPE_ENUM'
+                  and current_field.get('typeName') == '.worldmonitor.supply_chain.v1.FlowSource'):
+              enum = next(item for item in current_file['enumType'] if item['name'] == 'FlowSource')
+              actual = [(value['name'], value['number'], value.get('options', {}).get('[sebuf.http.enum_value]'))
+                        for value in enum['value']]
+              expected = [('FLOW_SOURCE_UNSPECIFIED', 0, None),
+                          ('FLOW_SOURCE_PORTWATCH_DWT', 1, 'portwatch-dwt'),
+                          ('FLOW_SOURCE_PORTWATCH_COUNTS', 2, 'portwatch-counts')]
+              if actual != expected:
+                  raise SystemExit('FlowSource differs from the reviewed #6101 JSON taxonomy; refusing normalization')
+              current_field['type'] = 'TYPE_STRING'
+              del current_field['typeName']
+              print('Verified the #6101 FlowEstimate.source JSON taxonomy transition')
+
+          (temp / 'proto-compat.json').write_text(json.dumps(current))
+          PY
+          buf breaking "$RUNNER_TEMP/proto-compat.json" --against "$RUNNER_TEMP/proto-base.json"
 
   fork-artifact-check:
     needs: changes

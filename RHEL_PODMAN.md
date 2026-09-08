@@ -87,6 +87,10 @@ branch, and still limits fork-only commits. All checks against the fork's
 `origin/main` remain enabled. This option does not authorize merging or deploying.
 The identity guard likewise preserves authors in that verified upstream history;
 new fork commits and the shared Git identity configuration remain checked.
+Proto compatibility follows the documented JSON-only API contract. The first
+sync recognizes upstream's exact `FlowEstimate.source` string-to-enum transition
+with its preserved custom JSON values. Only the comparison descriptor is
+normalized; the real schema and all other compatibility checks remain intact.
 The upstream Railway rollout-evidence gate runs only in the upstream repository:
 its historical production activation acknowledgements do not describe a fresh
 self-hosted Redis instance. The checker regression tests and application tests
