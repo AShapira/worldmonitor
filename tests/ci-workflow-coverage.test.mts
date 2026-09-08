@@ -714,13 +714,16 @@ describe('CI workflow coverage', () => {
     const breakingStep = workflowStepBlock(protoCheckWorkflow, 'Check for breaking proto changes');
     assert.match(
       breakingStep,
-      /^\s+run: make breaking\s*$/m,
-      'proto-check.yml must run the canonical buf breaking target against the fetched origin/main proto baseline',
+      /^\s+working-directory: proto\s*$/m,
+      'proto-check.yml must resolve the comparison inputs from the proto directory',
     );
+    assert.match(breakingStep, /buf build '\.\.\/\.git#branch=origin\/main,subdir=proto'/,
+      'the comparison image must come from the fetched origin/main baseline');
+    assert.match(breakingStep, /buf breaking "\$RUNNER_TEMP\/proto-compat\.json" --against "\$RUNNER_TEMP\/proto-base\.json"/,
+      'the normalized JSON descriptor must still pass the complete buf compatibility policy');
     assert.doesNotMatch(breakingStep, /^\s+continue-on-error:/m);
 
-    // Pin the shared Makefile baseline. `run: make breaking` alone stays green if the
-    // recipe regresses to proto/.git#branch=main (no repo) or loses origin/main.
+    // Keep the developer Makefile on the same real Git baseline as the workflow.
     const makefile = read(resolve(root, 'Makefile'));
     assert.match(
       makefile,
