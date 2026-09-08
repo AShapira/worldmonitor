@@ -364,12 +364,21 @@ if (!isDesktopRuntime()) secretsReadyResolve();
 
 const listeners = new Set<() => void>();
 
+function isLocalOperatorMode(): boolean {
+  try {
+    return Boolean(import.meta.env.VITE_LOCAL_OPERATOR_MODE === '1');
+  } catch {
+    // sentry-coverage-ok: Node consumers have no Vite env; operator mode defaults off.
+    return false;
+  }
+}
+
 const runtimeConfig: RuntimeConfig = {
   featureToggles: readStoredToggles(),
   // The Docker deployment keeps the operator key in nginx and injects it
   // server-side. Expose presence only so local premium panels unlock without
   // placing the key in the Vite bundle or renderer memory.
-  secrets: import.meta.env?.VITE_LOCAL_OPERATOR_MODE === '1'
+  secrets: isLocalOperatorMode()
     ? { WORLDMONITOR_API_KEY: { source: 'vault' } }
     : {},
 };
