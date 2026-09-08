@@ -27,6 +27,29 @@ BAD_EMAIL_RE='@example\.(invalid|test|com)$|^e@e\.co$|^fixture@|^test@worldmonit
 ZERO_RE='^0+$'
 fail=0
 
+# Preserve published upstream ancestry during an explicit fork sync. Historical
+# upstream identities are not ours to rewrite; new fork commits still pass the
+# normal identity check. Refresh the remote before trusting the declared SHA.
+sync_exclusion=()
+if [ -n "${WM_UPSTREAM_SYNC_SHA:-}" ]; then
+  if ! [[ "$WM_UPSTREAM_SYNC_SHA" =~ ^[0-9a-f]{40}$ ]] || ! node - <<'NODE'
+const { spawnSync } = require('node:child_process');
+const result = spawnSync('git', ['fetch', '--no-tags', 'upstream', 'main:refs/remotes/upstream/main', '--quiet'], {
+  stdio: 'ignore', timeout: 60_000, killSignal: 'SIGTERM',
+});
+process.exit(result.error ? 1 : (result.status ?? 1));
+NODE
+  then
+    echo "IDENTITY GATE: could not verify the declared upstream sync; refusing to push."
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor "$WM_UPSTREAM_SYNC_SHA" refs/remotes/upstream/main; then
+    echo "IDENTITY GATE: declared sync SHA is not published on upstream/main."
+    exit 1
+  fi
+  sync_exclusion=("^$WM_UPSTREAM_SYNC_SHA")
+fi
+
 report_commit() {
   echo "IDENTITY GATE: refusing to push commit $1"
   echo "  author:    $2"
@@ -41,7 +64,7 @@ check_range() {
   # than treat "no output" as "no commits": a swallowed resolution error here
   # is exactly the vacuous pass this gate exists to prevent.
   local log_output
-  if ! log_output=$(git log --format='%H%x09%an <%ae>%x09%cn <%ce>' "$@" 2>/dev/null); then
+  if ! log_output=$(git log --format='%H%x09%an <%ae>%x09%cn <%ce>' "${sync_exclusion[@]}" "$@" 2>/dev/null); then
     return 1
   fi
   while IFS=$'\t' read -r sha author committer; do
@@ -63,6 +86,12 @@ check_range() {
 while read -r _local_ref local_sha _remote_ref remote_sha; do
   [ -z "${local_sha:-}" ] && continue
   if printf '%s' "$local_sha" | grep -qE "$ZERO_RE"; then continue; fi # deletion
+  if [ -n "${WM_UPSTREAM_SYNC_SHA:-}" ] &&
+     ! git merge-base --is-ancestor "$WM_UPSTREAM_SYNC_SHA" "$local_sha"; then
+    echo "IDENTITY GATE: pushed ref does not contain the declared upstream sync."
+    fail=1
+    continue
+  fi
   if [ -n "${remote_sha:-}" ] && ! printf '%s' "$remote_sha" | grep -qE "$ZERO_RE"; then
     if ! check_range "$remote_sha..$local_sha"; then
       # Advertised remote tip is not in the local object database (unfetched

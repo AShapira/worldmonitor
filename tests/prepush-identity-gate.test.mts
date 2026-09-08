@@ -68,17 +68,46 @@ function makeRepo(identity: { name: string; email: string }): string {
   return root;
 }
 
-function runGate(cwd: string, stdinLines: string[]): { status: number | null; out: string } {
+function runGate(cwd: string, stdinLines: string[], env: Record<string, string> = {}): { status: number | null; out: string } {
   const result = spawnSync('bash', [GATE], {
     cwd,
     input: stdinLines.map((line) => `${line}\n`).join(''),
     encoding: 'utf8',
-    env: isolatedEnv(),
+    env: isolatedEnv(env),
   });
   return { status: result.status, out: `${result.stdout}\n${result.stderr}` };
 }
 
 describe('prepush-identity-gate.sh', () => {
+  it('preserves verified upstream history but rejects new bad authors and poisoned config', () => {
+    const upstream = makeRepo({ name: 'Published Fixture', email: 'test@example.com' });
+    const repo = mkdtempSync(join(tmpdir(), 'wm-identity-sync-'));
+    fixtures.push(repo);
+    git(repo, ['clone', '--quiet', upstream, '.']);
+    git(repo, ['remote', 'rename', 'origin', 'upstream']);
+    git(repo, ['config', 'user.name', 'Real Person']);
+    git(repo, ['config', 'user.email', 'real@worldmonitor.dev']);
+    const imported = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['commit', '--allow-empty', '--quiet', '-m', 'fork integration']);
+    const head = git(repo, ['rev-parse', 'HEAD']);
+    const line = (sha: string, base = ZERO) => `refs/heads/main ${sha} refs/heads/main ${base}`;
+    const env = { WM_UPSTREAM_SYNC_SHA: imported };
+    assert.equal(runGate(repo, [line(head)]).status, 1, 'historical exception must be explicit');
+    assert.equal(runGate(repo, [line(head)], env).status, 0);
+    assert.equal(runGate(repo, [line(head, imported)], env).status, 0);
+    assert.equal(runGate(repo, [line(head)], { WM_UPSTREAM_SYNC_SHA: head }).status, 1, 'fork-only SHA is not upstream');
+    assert.equal(runGate(repo, [line(head)], { WM_UPSTREAM_SYNC_SHA: 'main' }).status, 1, 'require full SHA');
+    git(repo, ['config', 'user.email', 'test@example.com']);
+    assert.equal(runGate(repo, [line(head)], env).status, 1, 'shared config remains guarded');
+    git(repo, ['commit', '--allow-empty', '--quiet', '-m', 'new bad author']);
+    const bad = git(repo, ['rev-parse', 'HEAD']);
+    git(repo, ['config', 'user.email', 'real@worldmonitor.dev']);
+    assert.equal(runGate(repo, [line(bad)], env).status, 1, 'new-branch range remains guarded');
+    assert.equal(runGate(repo, [line(bad, head)], env).status, 1, 'update range remains guarded');
+    git(repo, ['remote', 'remove', 'upstream']);
+    assert.equal(runGate(repo, [line(head)], env).status, 1, 'unverifiable upstream fails closed');
+  });
+
   it('blocks a new-branch push whose commit is fixture-authored', () => {
     const repo = makeRepo({ name: 'Fixture', email: 'fixture@example.invalid' });
     const sha = git(repo, ['rev-parse', 'HEAD']);
