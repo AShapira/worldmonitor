@@ -5,12 +5,52 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { parseEnv } from 'node:util';
+import http from 'node:http';
+import https from 'node:https';
+import vm from 'node:vm';
 import { parse as parseYaml } from 'yaml';
+import modelPolicy from '../scripts/lib/llm-model-policy.cjs';
 
 const root = resolve(import.meta.dirname, '..');
 const read = (path) => readFileSync(resolve(root, path), 'utf8');
 
 describe('Podman environment upgrades', () => {
+  it('the relay requests usable Qwen classifications instead of reasoning-only completions', async () => {
+    let requestBody;
+    const server = http.createServer(async (req, res) => {
+      let data = '';
+      for await (const chunk of req) data += chunk;
+      requestBody = JSON.parse(data);
+      // Model the OpenAI-compatible response when reasoning consumes the
+      // entire short completion budget, versus a usable classification.
+      const content = requestBody.reasoning_effort === 'none'
+        ? '[{"i":0,"l":"info","c":"general"}]' : '';
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ choices: [{ message: { content } }] }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      // Execute the production provider chain and HTTP request implementation
+      // without booting the relay's unrelated long-lived ingestion loops.
+      const source = read('scripts/ais-relay.cjs');
+      const start = source.indexOf('const CLASSIFY_LLM_PROVIDERS =');
+      const end = source.indexOf('let classifyInFlight =', start);
+      assert.ok(start >= 0 && end > start);
+      const classify = vm.runInNewContext(source.slice(start, end) + '\nclassifyFetchLlm', {
+        ...modelPolicy, http, https, URL, Buffer, console,
+        CHROME_UA: 'worldmonitor-fixture/1.0', CLASSIFY_SYSTEM_PROMPT: 'Classify the test headline.',
+        process: { env: { OLLAMA_API_URL: `http://127.0.0.1:${server.address().port}`, OLLAMA_MODEL: 'qwen3:14b' } },
+      });
+      const result = await classify(['A public library opens.']);
+      assert.deepEqual(JSON.parse(JSON.stringify(result)), [{ i: 0, l: 'info', c: 'general' }]);
+      assert.equal(requestBody.model, 'qwen3:14b');
+      assert.equal(requestBody.max_tokens, 40);
+      assert.equal(requestBody.think, false);
+    } finally {
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   for (const command of ['init', 'config', 'build', 'up', 'restart']) {
     it(`${command} adds the session secret once and preserves operator settings`, () => {
       const fixture = mkdtempSync(resolve(tmpdir(), 'wm-podman-upgrade-'));

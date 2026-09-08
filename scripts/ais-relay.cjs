@@ -4797,7 +4797,9 @@ const CLASSIFY_LLM_PROVIDERS = [
       if (apiKey) h.Authorization = `Bearer ${apiKey}`;
       return h;
     },
-    extraBody: { think: false },
+    // Ollama's OpenAI-compatible route needs this control for Qwen 3;
+    // otherwise the short classifier budget can produce reasoning only.
+    extraBody: { think: false, reasoning_effort: process.env.LLM_REASONING_EFFORT || 'none' },
     timeout: 30000,
   },
   {
