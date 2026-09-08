@@ -228,6 +228,8 @@ async function sendSignInPointer(
     );
     console.log(`[subscriptionEmails] Sign-in pointer sent to checkout address`);
   } catch (err) {
+    // sentry-coverage-ok: Convex forwards console.error; this optional
+    // pointer must not prevent the independently guarded welcome/admin sends.
     console.error(
       `[subscriptionEmails] Sign-in pointer to checkout address failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -421,6 +423,8 @@ export const sendSubscriptionEmails = internalAction({
       );
       console.log(`[subscriptionEmails] Welcome email sent to ${args.userEmail}`);
     } catch (err) {
+      // sentry-coverage-ok: Convex forwards console.error; continue so the
+      // checkout pointer and admin notification are still attempted.
       console.error(
         `[subscriptionEmails] Welcome email failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -459,6 +463,8 @@ export const sendSubscriptionEmails = internalAction({
       );
       console.log(`[subscriptionEmails] Admin notification sent for ${args.userEmail}`);
     } catch (err) {
+      // sentry-coverage-ok: Convex forwards console.error for this independently
+      // guarded admin notification; do not fail the subscription action.
       console.error(
         `[subscriptionEmails] Admin notification failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -514,6 +520,8 @@ export const sendReactivationEmail = internalAction({
       );
       console.log(`[subscriptionEmails] Reactivation email sent to ${args.userEmail}`);
     } catch (err) {
+      // sentry-coverage-ok: Convex forwards console.error; still attempt the
+      // independent sign-in pointer when the reactivation email fails.
       console.error(
         `[subscriptionEmails] Reactivation email failed (continuing): ${err instanceof Error ? err.message : String(err)}`,
       );
