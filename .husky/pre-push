@@ -643,8 +643,16 @@ if changed '^(src/|api/|server/|scripts/check-sentry-coverage\.mjs$)'; then
 fi
 
 if changed '^(api/health\.js|scripts/check-health-probe-cutovers\.mts|scripts/check-seed-freshness\.mjs|scripts/seed-freshness-baseline\.json)$'; then
-  echo "Running health-probe cutover check..."
-  node --import tsx scripts/check-health-probe-cutovers.mts origin/main || exit 1
+  # This is the production Railway deployment-order gate, not a source or
+  # cache correctness test. A self-hosted fork starts its own empty Redis;
+  # it cannot reproduce upstream's retired Railway activation evidence.
+  case "$(git remote get-url origin)" in
+    https://github.com/koala73/worldmonitor|https://github.com/koala73/worldmonitor.git|git@github.com:koala73/worldmonitor.git)
+      echo "Running upstream Railway health-probe cutover check..."
+      node --import tsx scripts/check-health-probe-cutovers.mts origin/main || exit 1
+      ;;
+    *) echo "Upstream Railway rollout-evidence check is not applicable to this fork (checker regression tests still run)." ;;
+  esac
 else
   echo "Health-probe cutover check skipped (no health registry or cutover-policy changes)."
 fi

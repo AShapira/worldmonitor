@@ -348,6 +348,10 @@ jobs:
           pip install opencc-python-reimplemented==0.1.7
           python3 scripts/convert-zh-tw.py --check
       - name: Enforce health-probe cutovers
+        # This checks deployment ordering in koala73's live Railway fleet.
+        # Self-hosted forks start their own caches and cannot reproduce its
+        # expired rollout acknowledgements. Source/handler tests run below.
+        if: github.repository == 'koala73/worldmonitor'
         env:
           # NOT github.event.pull_request.base.sha. GitHub pins that SHA when the
           # PR is opened and never advances it as main moves, but actions/checkout

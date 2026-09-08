@@ -85,6 +85,10 @@ guard accepts `WM_UPSTREAM_SYNC_SHA` set to the full imported commit SHA. It
 refreshes `upstream/main`, verifies that SHA is in both upstream and the local
 branch, and still limits fork-only commits. All checks against the fork's
 `origin/main` remain enabled. This option does not authorize merging or deploying.
+The upstream Railway rollout-evidence gate runs only in the upstream repository:
+its historical production activation acknowledgements do not describe a fresh
+self-hosted Redis instance. The checker regression tests and application tests
+still run in this fork; use local seeder and API verification for local readiness.
 
 ```bash
 ./scripts/podman-local.sh status
