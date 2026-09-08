@@ -75,19 +75,33 @@ export interface CachedEntitlements {
      */
     dataExport?: boolean;
     /**
+     * Partner-embed key issuance (`wme_…`). Mirrors the catalog field so the
+     * edge can read what the Convex read-time merge already puts on the wire;
+     * without it a caller cannot reach the value without a type error, and
+     * `shared/embed-access.ts` would silently see `undefined`. Like
+     * `mcpAccess` and unlike `dataExport`, `undefined` is **fail-CLOSED** —
+     * embedding is a publishable credential, so a stale row must not mint one.
+     */
+    embedAccess?: boolean;
+    /**
      * Catalog plan limits, mirrored verbatim from `PlanFeatures.planLimits`
      * (convex/config/productCatalog.ts). Optional because legacy rows predate
      * it and because the Convex read path only merges what the catalog holds.
      * `null` on a member means **unlimited**; a MISSING member (or a missing
      * `planLimits` altogether) means unknown, and consumers resolve unknown
      * toward cost protection — never toward the higher allowance. The MCP
-     * daily quota (plan 2026-07-25-001 U3) is the first consumer.
+     * daily quota (plan 2026-07-25-001 U3) and dashboard-AI quota are consumers.
+     *
+     * `mcpCallsPerDay` also carries the catalog's `SHARED_API_BUDGET` marker on
+     * the API tiers, so it is not a plain number: mirroring it as `number | null`
+     * made the value the API tiers actually ship an impossible one here.
      */
     planLimits?: {
       apiRequestsPerDay?: number | null;
       apiBurstRequestsPerMinute?: number | null;
-      mcpCallsPerDay?: number | null;
+      mcpCallsPerDay?: number | null | 'shared-api-budget';
       mcpBurstRequestsPerMinute?: number | null;
+      dashboardAiCallsPerDay?: number | null;
     };
   };
   validUntil: number;
@@ -168,6 +182,26 @@ const ENDPOINT_ENTITLEMENTS: Record<string, number> = {
   '/api/supply-chain/v1/get-sector-dependency': 1,
   '/api/trade/v1/list-comtrade-flows': 1,
   '/api/trade/v1/get-tariff-trends': 1,
+  '/api/resilience/v1/get-food-stocks': 1,
+  '/api/resilience/v1/get-demographics-capability': 1,
+  '/api/resilience/v1/get-resilience-indicators': 1,
+  '/api/scorecard/v1/get-five-factor-scorecard': 1,
+  '/api/scorecard/v1/list-five-factor-scorecards': 1,
+  '/api/scorecard/v1/get-bloc-scorecard': 1,
+  // Physical-vs-paper metals (#6436 series, #6448 index), mineral production
+  // concentration (#6439), arms-supplier dependency (#6438) and commodity
+  // supply vulnerability (#6449). Each shipped ungated because the issues
+  // scoped ingestion + exposure and never named an access tier; the audit that
+  // produced this block found all seven serving full payloads to an anonymous
+  // wms_ session. They belong beside their siblings above: the same seeded
+  // derived-analytics product the resilience and scorecard routes sell.
+  '/api/market/v1/get-physical-premiums': 1,
+  '/api/market/v1/get-physical-divergence-index': 1,
+  '/api/supply-chain/v1/get-mineral-production': 1,
+  '/api/military/v1/get-defense-industrial-base': 1,
+  '/api/supply-chain/v1/get-country-vulnerabilities': 1,
+  '/api/supply-chain/v1/get-chokepoint-dependencies': 1,
+  '/api/supply-chain/v1/list-vulnerability-rankings': 1,
 };
 
 const CONVEX_INTERNAL_ENTITLEMENTS_PATH = '/api/internal-entitlements';
@@ -513,10 +547,13 @@ async function _getEntitlementsImpl(userId: string): Promise<CachedEntitlements 
 
     if (cached && typeof cached === 'object') {
       const ent = cached as CachedEntitlements;
+      const hasCurrentEmbedAccessShape = typeof ent.features?.embedAccess === 'boolean';
       // Verification markers have their own short Redis TTL. Serve them even
       // though validUntil is expired so cooldown requests stop at Redis instead
-      // of repeating the Convex action/claim chain.
-      if (entitlementMarkerTtlSeconds(ent) !== null) return ent;
+      // of repeating the Convex action/claim chain. The cache-shape check must
+      // run first: a pre-embedAccess marker is still an authorization row, and
+      // serving it would bypass the canonical Convex merge below.
+      if (hasCurrentEmbedAccessShape && entitlementMarkerTtlSeconds(ent) !== null) return ent;
       // Only use cached data if it hasn't expired AND has the post-U10 shape.
       //
       // Legacy cache entries written before plan 2026-05-10-001 U10 lack the
@@ -530,9 +567,30 @@ async function _getEntitlementsImpl(userId: string): Promise<CachedEntitlements 
       // post-U10 layout. Self-healing, bounded to one extra Convex
       // round-trip per affected user during the migration window.
       // Reviewer round-2 P2 (cache layer).
+      //
+      // The same trap re-opened for `planLimits.dashboardAiCallsPerDay`: a
+      // cache entry written before that dimension shipped already satisfies the
+      // mcpAccess check, so it would be served as fresh WITHOUT the new member
+      // and every paid tier above Pro would silently resolve to the Pro default
+      // (Pro Business 2,500 -> 500, API Business 10,000 -> 500). Require the
+      // member the same way, so those rows self-heal through Convex instead.
+      // Third instance of the same trap, for `planLimits.mcpCallsPerDay`. An
+      // API-tier entry written before the shared-budget marker carries the old
+      // numeric 1,000/10,000, which satisfies both checks above and resolves
+      // `{allowance: 'mcp'}` — same counter and same ceiling as the correct
+      // `{allowance: 'api', counter: 'mcp'}`, but one unit per call instead of
+      // the per-tool weight, so those callers under-pay until the entry ages
+      // out. No paid plan legitimately pairs `apiAccess` with a NUMERIC
+      // mcpCallsPerDay (the API tiers carry the marker, enterprise carries
+      // `null`), so that pairing identifies a pre-marker entry exactly.
+      const legacySharedBudgetShape = ent.features.apiAccess === true
+        && typeof ent.features.planLimits?.mcpCallsPerDay === 'number';
       if (
         ent.validUntil >= Date.now() &&
-        typeof (ent.features as { mcpAccess?: boolean }).mcpAccess === 'boolean'
+        typeof (ent.features as { mcpAccess?: boolean }).mcpAccess === 'boolean' &&
+        hasCurrentEmbedAccessShape &&
+        ent.features.planLimits?.dashboardAiCallsPerDay !== undefined &&
+        !legacySharedBudgetShape
       ) {
         return ent;
       }

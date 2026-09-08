@@ -1,0 +1,102 @@
+{
+  "comment": "Initial /dashboard bundle-size budgets (#7111). Gated on raw bytes: per chunk ±max(2048 B, 2%), total ±max(16384 B, 0.25%). Tolerance fields here are informational — the gate enforces its own constants and rejects a snapshot that disagrees. Regenerate after \"npm run build:pro && VITE_VARIANT=full ./node_modules/.bin/vite build\" with: npm run bundle:budgets",
+  "surface": "dashboard",
+  "variant": "full",
+  "tolerancePct": 2,
+  "toleranceBytes": 2048,
+  "totalTolerancePct": 0.25,
+  "totalToleranceBytes": 16384,
+  "total": {
+    "raw": 1755552
+  },
+  "chunks": {
+    "analytics": {
+      "raw": 133239,
+      "files": 1
+    },
+    "cached-risk-scores": {
+      "raw": 24604,
+      "files": 1
+    },
+    "clerk": {
+      "raw": 18223,
+      "files": 1
+    },
+    "continuous": {
+      "raw": 4933,
+      "files": 1
+    },
+    "cross-domain-storage": {
+      "raw": 415,
+      "files": 1
+    },
+    "data-freshness": {
+      "raw": 85940,
+      "files": 1
+    },
+    "dom-utils": {
+      "raw": 3856,
+      "files": 1
+    },
+    "embed-url": {
+      "raw": 63771,
+      "files": 1
+    },
+    "font-settings": {
+      "raw": 1440,
+      "files": 1
+    },
+    "gdelt-intel": {
+      "raw": 133788,
+      "files": 1
+    },
+    "i18n": {
+      "raw": 52460,
+      "files": 1
+    },
+    "layout-batch": {
+      "raw": 17352,
+      "files": 1
+    },
+    "main": {
+      "raw": 985080,
+      "files": 1
+    },
+    "panel-gating": {
+      "raw": 3144,
+      "files": 1
+    },
+    "panels": {
+      "raw": 147801,
+      "files": 1
+    },
+    "persistent-cache": {
+      "raw": 3697,
+      "files": 1
+    },
+    "storage-facility-registry-store": {
+      "raw": 14203,
+      "files": 1
+    },
+    "string": {
+      "raw": 20823,
+      "files": 1
+    },
+    "theme-manager": {
+      "raw": 1474,
+      "files": 1
+    },
+    "timeout-signal": {
+      "raw": 776,
+      "files": 1
+    },
+    "user-location": {
+      "raw": 12676,
+      "files": 1
+    },
+    "widget-store": {
+      "raw": 25857,
+      "files": 1
+    }
+  }
+}

@@ -14,6 +14,9 @@
 // server is simply the right place to do it once for everyone.
 
 import { getCachedJson } from '../../../_shared/redis';
+import { filterRevokedUrls, readRevokedUrlSet } from '../../../_shared/digest-revocations';
+import { sanitizeForPromptLine } from '../../../_shared/llm-sanitize.js';
+import { countryMentionTerms, mentionsCountry } from '../../../../shared/country-mention.js';
 
 const DIGEST_KEY_EN = 'news:digest:v1:full:en';
 const MAX_GROUNDING_ITEMS = 15;
@@ -44,20 +47,24 @@ export interface CountryIntelCacheKeyOpts {
   frameworkHash: string;
   /** OWID energy data-year, or '' when unavailable. */
   energyYear: string;
+  /** Audited primary-energy import data-year, or '' when unavailable. */
+  energyImportYear: string;
 }
 
 export function deriveCountryIntelCacheKey(opts: CountryIntelCacheKeyOpts): string {
-  // v4 → v5 (2026-07-06, #4944): intel briefs moved to deepseek-v4-flash;
-  // v4 rows carry old-model prose and must age out at cutover.
+  // v5 to v6 removes cached briefs that could describe missing import data as 0%.
+  // v6 to v7 removes briefs generated with the ISO code as the country name
+  // ("WHAT THIS MEANS FOR NO", #7738) and grounded by the code-token matcher.
   const energyTag = opts.energyYear ? `:e${opts.energyYear}` : '';
+  const energyImportTag = opts.energyImportYear ? `:i${opts.energyImportYear}` : '';
   if (!opts.isPremium) {
     // Anonymous tier: caller inputs must not reach the key, or the shared
     // cache degenerates back into a per-caller one (and one caller's
     // context could mint entries served to everyone).
-    return `ci-sebuf:v5:${opts.countryCode}:${opts.lang}:shared${energyTag}`;
+    return `ci-sebuf:v7:${opts.countryCode}:${opts.lang}:shared${energyTag}${energyImportTag}`;
   }
   const fw = opts.frameworkHash ? `:${opts.frameworkHash}` : '';
-  return `ci-sebuf:v5:${opts.countryCode}:${opts.lang}:${opts.contextHash}${fw}${energyTag}`;
+  return `ci-sebuf:v7:${opts.countryCode}:${opts.lang}:${opts.contextHash}${fw}${energyTag}${energyImportTag}`;
 }
 
 interface DigestItemForBrief {
@@ -112,59 +119,6 @@ function normalizeDate(value: unknown): string {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : '';
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** Case-insensitive word-boundary match — for display NAMES only. */
-export function includesCountryTerm(text: string, term: string): boolean {
-  const normalizedTerm = term.trim().toLowerCase();
-  if (!normalizedTerm) return false;
-  return new RegExp(`(^|[^a-z0-9])${escapeRegExp(normalizedTerm)}(?=$|[^a-z0-9])`, 'i').test(text);
-}
-
-/**
- * ISO codes match ONLY as uppercase tokens in the raw (non-lowercased) text.
- * Codes like IN, US, AT, NO collide with common English words — a
- * case-insensitive match swept "rally in Europe" into India's shared brief
- * (post-#4898 review, P2). Real code mentions in headlines are uppercase
- * ("US announces…", "exports from IN"); anything else is prose.
- */
-export function includesCountryCodeToken(text: string, code: string): boolean {
-  const normalized = code.trim().toUpperCase();
-  if (!normalized) return false;
-  return new RegExp(`(^|[^A-Za-z0-9])${escapeRegExp(normalized)}(?=$|[^A-Za-z0-9])`).test(text);
-}
-
-export interface CountryMatchTerms {
-  code: string;
-  names: string[];
-}
-
-export function countryBriefSearchTerms(countryCode: string): CountryMatchTerms {
-  const code = countryCode.trim().toUpperCase();
-  const names: string[] = [];
-  try {
-    const name = new Intl.DisplayNames(['en'], { type: 'region' }).of(code);
-    // Unknown regions come back as a code echo or the ICU "Unknown Region"
-    // sentinel — neither is a real name, and an echoed code as a lowercase
-    // word-match term would reintroduce the stopword collision this split
-    // exists to prevent.
-    if (name && name.toUpperCase() !== code && name.toLowerCase() !== 'unknown region') {
-      names.push(name.toLowerCase());
-    }
-  } catch {
-    /* Intl.DisplayNames can be missing in constrained runtimes. */
-  }
-  return { code, names };
-}
-
-/** Display name is the primary signal; the ISO code counts only as an uppercase token. */
-export function matchesCountry(rawText: string, terms: CountryMatchTerms): boolean {
-  if (terms.names.some((name) => includesCountryTerm(rawText, name))) return true;
-  return includesCountryCodeToken(rawText, terms.code);
-}
-
 function collectBriefSources(items: DigestItemForBrief[], maxSources = MAX_SOURCES): SharedBriefSource[] {
   const out: SharedBriefSource[] = [];
   const seen = new Set<string>();
@@ -188,18 +142,31 @@ function briefSourceContextLines(sources: SharedBriefSource[]): string[] {
   });
 }
 
-export function buildSharedCountryContext(digest: unknown, countryCode: string): SharedCountryContext {
-  const allItems = flattenDigest(digest).filter(
+export function buildSharedCountryContext(
+  digest: unknown,
+  countryCode: string,
+  revokedUrls: ReadonlySet<string> = new Set(),
+): SharedCountryContext {
+  // #7084: the stored digest body is deliberately UNFILTERED so a lifted
+  // revocation restores its items, which means every reader of
+  // news:digest:v1:* has to apply the operator suppression set itself. Skipping
+  // it here published a revoked URL in this brief's `sources[]` — and the brief
+  // is cached for 6h, so it outlived the digest's own TTL.
+  const allItems = filterRevokedUrls(flattenDigest(digest), revokedUrls).kept.filter(
     (item) => typeof item.title === 'string' && item.title.length > 0,
   );
   if (allItems.length === 0) return EMPTY_CONTEXT;
 
-  const terms = countryBriefSearchTerms(countryCode);
-  // Raw text, NOT lowercased — the uppercase-token code match depends on the
-  // original casing surviving to this point.
+  // Country matching is the shared matcher (shared/country-mention.js):
+  // display names, aliases and case-sensitive demonyms, bare ISO codes only
+  // for the allowlist. The local copy this replaced matched every uppercase
+  // code token, which was safe for "US announces…" and wrong for "African
+  // Union (AU)", "2pm ET" or "CM Maryam" — the defect the corpus freeze
+  // published (#7748). Raw text, NOT lowercased: demonyms are case-sensitive.
+  const terms = countryMentionTerms(countryCode);
   const countryItems = allItems.filter((item) => {
     const text = `${typeof item.title === 'string' ? item.title : ''} ${typeof item.snippet === 'string' ? item.snippet : ''}`;
-    return matchesCountry(text, terms);
+    return mentionsCountry(text, terms);
   });
 
   // No country match → ground on the top global items instead. A generic
@@ -207,8 +174,14 @@ export function buildSharedCountryContext(digest: unknown, countryCode: string):
   const groundingItems = (countryItems.length > 0 ? countryItems : allItems).slice(0, MAX_GROUNDING_ITEMS);
   const sources = collectBriefSources(groundingItems);
   const sourceLines = sources.length > 0 ? ['Brief source articles:', ...briefSourceContextLines(sources)] : [];
+  // Digest titles are feed-derived and land one-per-line under a 'Headlines:'
+  // marker, so this block carried both gaps #5857 closed elsewhere: no #3724
+  // content sanitization at all, and no delimiter guard -- a single newline in
+  // a title forges an extra headline the brief reads as a real story. (The
+  // sibling source lines above are accidentally safe only because
+  // JSON.stringify escapes the newline.)
   const headlineLines = groundingItems
-    .map((item) => (typeof item.title === 'string' ? item.title : ''))
+    .map((item) => (typeof item.title === 'string' ? sanitizeForPromptLine(item.title) : ''))
     .filter(Boolean);
   const contextSnapshot = [...sourceLines, 'Headlines:', ...headlineLines].join('\n').slice(0, MAX_CONTEXT_CHARS);
   return { contextSnapshot, sources };
@@ -217,8 +190,15 @@ export function buildSharedCountryContext(digest: unknown, countryCode: string):
 /** Read the shared digest and build country grounding. Failure → empty context (brief still generates). */
 export async function fetchSharedCountryContext(countryCode: string): Promise<SharedCountryContext> {
   try {
-    const digest = await getCachedJson(DIGEST_KEY_EN, true);
-    return buildSharedCountryContext(digest, countryCode);
+    const [digest, revoked] = await Promise.all([
+      getCachedJson(DIGEST_KEY_EN, true),
+      readRevokedUrlSet(),
+    ]);
+    // Fail CLOSED on an unreadable suppression set, matching the digest
+    // endpoint's own replay tiers: this brief is cached for 6h, so grounding it
+    // on content we could not check would outlive the incident that caused it.
+    if (!revoked.readable) return EMPTY_CONTEXT;
+    return buildSharedCountryContext(digest, countryCode, revoked.urls);
   } catch {
     return EMPTY_CONTEXT;
   }

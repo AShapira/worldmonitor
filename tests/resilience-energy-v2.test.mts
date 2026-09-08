@@ -27,6 +27,7 @@ import {
   scoreEnergy,
   type ResilienceSeedReader,
 } from '../server/worldmonitor/resilience/v1/_dimension-scorers.ts';
+import { createIndicatorTraceCollector } from '../server/worldmonitor/resilience/v1/_indicator-trace.ts';
 
 const TEST_ISO2 = 'ZZ'; // fictional country so test coverage checks don't flag it
 
@@ -81,10 +82,6 @@ describe('scoreEnergy — RESILIENCE_ENERGY_V2_ENABLED=false (default)', () => {
     delete process.env.RESILIENCE_ENERGY_V2_ENABLED;
   });
 
-  it('repo default remains legacy until production v2 seed health is verified', () => {
-    assert.equal(process.env.RESILIENCE_ENERGY_V2_ENABLED, undefined);
-  });
-
   it('reads legacy inputs — higher renewShare raises score', async () => {
     const low = await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2, { mix: { gasShare: 30, coalShare: 20, renewShare: 5 } }));
     const high = await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2, { mix: { gasShare: 30, coalShare: 20, renewShare: 70 } }));
@@ -106,10 +103,6 @@ describe('scoreEnergy — RESILIENCE_ENERGY_V2_ENABLED=true', () => {
   });
   after(() => {
     delete process.env.RESILIENCE_ENERGY_V2_ENABLED;
-  });
-
-  it('flag is on', () => {
-    assert.equal(process.env.RESILIENCE_ENERGY_V2_ENABLED, 'true');
   });
 
   it('v2 path reads importedFossilDependence — lower fossilElectricityShare raises score', async () => {
@@ -145,6 +138,41 @@ describe('scoreEnergy — RESILIENCE_ENERGY_V2_ENABLED=true', () => {
     const noNuclear = await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2, { lowCarbonGenerationShare: 5 }));
     const heavyNuclear = await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2, { lowCarbonGenerationShare: 75 }));
     assert.ok(heavyNuclear.score > noNuclear.score, `low-carbon 5→75 should raise score; got ${noNuclear.score} → ${heavyNuclear.score}`);
+  });
+
+  it('uses the oldest contributing source year for the imported-fossil composite', async () => {
+    const trace = createIndicatorTraceCollector();
+    await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2, {
+      staticRecord: {
+        iea: { energyImportDependency: { value: 40, year: 2018, source: 'worldbank' } },
+        infrastructure: { indicators: {} },
+      },
+      fossilBulk: { countries: { [TEST_ISO2]: { value: 50, year: 2024 } } },
+    }), { trace });
+    const composite = trace.readDimension('energy')?.contributions
+      .find((row) => row.indicatorId === 'importedFossilDependence');
+    assert.equal(composite?.sourceYear, 2018);
+    assert.deepEqual(composite?.observedSources, [
+      {
+        providerName: 'World Bank Open Data',
+        sourceUrl: 'https://api.worldbank.org/v2/country/all/indicator/EG.ELC.FOSL.ZS',
+      },
+      {
+        providerName: 'World Bank Open Data',
+        sourceUrl: 'https://api.worldbank.org/v2/country/all/indicator/EG.IMP.CONS.ZS',
+      },
+    ]);
+  });
+
+  it('records the exact low-carbon dataset while raw redistribution stays fail-closed', async () => {
+    const trace = createIndicatorTraceCollector();
+    await scoreEnergy(TEST_ISO2, makeEnergyReader(TEST_ISO2), { trace });
+    const lowCarbon = trace.readDimension('energy')?.contributions
+      .find((row) => row.indicatorId === 'lowCarbonGenerationShare');
+    assert.deepEqual(lowCarbon?.observedSources, [{
+      providerName: 'Our World in Data',
+      sourceUrl: 'https://ourworldindata.org/grapher/share-electricity-low-carbon',
+    }]);
   });
 
   it('higher powerLosses lowers score (grid-integrity penalty)', async () => {
@@ -198,6 +226,23 @@ describe('scoreEnergy — RESILIENCE_ENERGY_V2_ENABLED=true', () => {
         return true;
       },
     );
+  });
+
+  it('records only the active v2 indicator set before a preflight source failure', async () => {
+    const reader = makeReaderWithMissingV2Seeds(new Set([
+      'resilience:fossil-electricity-share:v1',
+      'resilience:low-carbon-generation:v1',
+      'resilience:power-losses:v1',
+    ]));
+    const trace = createIndicatorTraceCollector();
+    await assert.rejects(scoreEnergy(TEST_ISO2, reader, { trace }), ResilienceConfigurationError);
+    assert.deepEqual(trace.readDimension('energy')?.selectedIndicatorIds, [
+      'importedFossilDependence',
+      'lowCarbonGenerationShare',
+      'powerLossesPct',
+      'euGasStorageStress',
+      'energyPriceStress',
+    ]);
   });
 
   it('flag on + partial missing (only fossil-share absent) → throws naming ONLY the missing key', async () => {

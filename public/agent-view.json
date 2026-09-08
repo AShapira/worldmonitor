@@ -9,12 +9,13 @@
       "url": "https://worldmonitor.app/mcp",
       "transport": "streamable-http",
       "serverCard": "https://worldmonitor.app/.well-known/mcp/server-card.json",
-      "tools": 59,
-      "note": "tools/list, prompts/list, resources/list and describe_tool are anonymous; data calls need auth."
+      "note": "Call tools/list or read the server card for the live tool inventory. tools/list, prompts/list and resources/list are anonymous. get_sources is the sole credential-free, daily-quota-free data tool and has a separate fail-closed 10/min/IP anonymous limit; describe_tool and all other tool calls need subscription auth."
     },
     "rest": {
       "base": "https://api.worldmonitor.app",
-      "openapi": "https://worldmonitor.app/openapi.json",
+      "openapi": "https://www.worldmonitor.app/openapi.json",
+      "protocol": "REST",
+      "graphql": false,
       "note": "Send a descriptive User-Agent; generic UAs are filtered at the edge. Fetch the OpenAPI spec for the full operation list."
     },
     "a2a": {
@@ -69,7 +70,12 @@
     "mcp": "curl -X POST https://worldmonitor.app/mcp -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'"
   },
   "authentication": {
-    "summary": "Authentication: OAuth2 (scope=mcp) or an API key header. Discovery surfaces (tools/list, describe_tool, prompts/list, resources/list, /a2a, /ask) are anonymous — no authentication required.",
+    "summary": "Authentication: OAuth2 (scope=mcp) or an API key header for subscription data. Discovery surfaces (tools/list, prompts/list, resources/list, /a2a, /ask) are anonymous. get_sources is the sole credential-free, daily-quota-free data tool; describe_tool and all other tool calls are subscription-gated.",
+    "freeDataTool": {
+      "name": "get_sources",
+      "dailyQuota": false,
+      "anonymousRateLimit": "10 requests/min per IP, fail closed"
+    },
     "oauth2": {
       "authorizationServer": "https://worldmonitor.app/.well-known/oauth-authorization-server",
       "protectedResource": "https://worldmonitor.app/.well-known/oauth-protected-resource",
@@ -78,14 +84,14 @@
     "apiKey": {
       "header": "X-WorldMonitor-Key",
       "format": "wm_<40 hex>",
-      "issueAt": "https://worldmonitor.app/pro"
+      "issueAt": "https://www.worldmonitor.app/pro"
     },
-    "guide": "https://worldmonitor.app/auth.md",
-    "plansAndLimits": "https://worldmonitor.app/pricing.md"
+    "guide": "https://www.worldmonitor.app/auth.md",
+    "plansAndLimits": "https://www.worldmonitor.app/pricing.md"
   },
   "rateLimits": {
-    "anonymous": "60 requests/min per IP on public MCP methods, /a2a and /ask",
-    "authenticated": "per-plan daily quotas — see https://worldmonitor.app/pricing.md"
+    "anonymous": "60 requests/min per IP on public MCP metadata methods, /a2a and /ask; get_sources uses a separate fail-closed 10 requests/min per IP ceiling",
+    "authenticated": "Per-minute burst is plan-resolved and shared per user across OAuth tokens and dashboard-issued wm_ keys: 60/minute on Pro, Pro Business and API Starter, 300 on API Business, 1000 on Enterprise. Subscription data calls reserve a per-user daily quota on the same plan-resolved budget through either door: Pro 50/day and Pro Business 250/day at one unit per call, API Starter 1000/day and API Business 10000/day drawn from the same allowance as their REST requests and charged at a per-tool weight of 1, 2 or 3, Enterprise unlimited. get_sources and metadata calls are daily-quota-free — see https://www.worldmonitor.app/pricing.md"
   },
   "documentation": "https://www.worldmonitor.app/docs/documentation",
   "capabilities": [
@@ -100,19 +106,21 @@
     "AI world/country briefs, scenario forecasts, prediction markets"
   ],
   "discovery": {
-    "llmsTxt": "https://worldmonitor.app/llms.txt",
-    "llmsFullTxt": "https://worldmonitor.app/llms-full.txt",
+    "llmsTxt": "https://www.worldmonitor.app/llms.txt",
+    "llmsFullTxt": "https://www.worldmonitor.app/llms-full.txt",
     "sectionLlmsTxt": {
-      "api": "https://worldmonitor.app/api/llms.txt",
+      "api": "https://www.worldmonitor.app/api/llms.txt",
       "docs": "https://www.worldmonitor.app/docs/llms.txt",
-      "developers": "https://worldmonitor.app/developers/llms.txt",
+      "developers": "https://www.worldmonitor.app/developers/llms.txt",
       "blog": "https://www.worldmonitor.app/blog/llms.txt"
     },
     "schemamap": "https://www.worldmonitor.app/schemamap.xml",
-    "markdownHomepage": "https://worldmonitor.app/index.md",
+    "markdownHomepage": "https://www.worldmonitor.app/index.md",
+    "agentPlugin": "https://www.worldmonitor.app/plugin.json",
     "agentSkills": "https://worldmonitor.app/.well-known/agent-skills/index.json",
     "apiCatalog": "https://worldmonitor.app/.well-known/api-catalog",
     "aiCatalog": "https://worldmonitor.app/.well-known/ai-catalog.json",
+    "productFacts": "https://www.worldmonitor.app/product-facts.json",
     "docs": "https://www.worldmonitor.app/docs/documentation"
   },
   "instances": {

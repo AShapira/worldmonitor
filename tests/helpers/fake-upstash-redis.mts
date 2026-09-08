@@ -10,14 +10,78 @@ export interface FakeRedisState {
   expires: Map<string, number>;
 }
 
-export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisState {
+export interface FakeRedisOptions {
+  now?: () => number;
+  initialExpiresAt?: Record<string, number>;
+}
+
+export function createRedisFetch(
+  fixtures: Record<string, unknown>,
+  { now = () => Date.now(), initialExpiresAt = {} }: FakeRedisOptions = {},
+): FakeRedisState {
   const redis = new Map<string, string>();
   const sortedSets = new Map<string, FakeRedisSortedSetEntry[]>();
   const expires = new Map<string, number>();
+  const expiryAt = new Map<string, number>();
 
   for (const [key, value] of Object.entries(fixtures)) {
     redis.set(key, JSON.stringify(value));
   }
+
+  const clearExpiry = (key: string) => {
+    expires.delete(key);
+    expiryAt.delete(key);
+  };
+
+  const removeKey = (key: string) => {
+    const existed = redis.delete(key);
+    clearExpiry(key);
+    return existed;
+  };
+
+  const expireDueKeys = () => {
+    const current = now();
+    for (const [key, deadline] of expiryAt) {
+      if (deadline <= current) removeKey(key);
+    }
+  };
+
+  for (const [key, deadline] of Object.entries(initialExpiresAt)) {
+    if (redis.has(key) && Number.isFinite(deadline)) {
+      expiryAt.set(key, deadline);
+      expires.set(key, Math.max(0, (deadline - now()) / 1000));
+    }
+  }
+  expireDueKeys();
+
+  const setExpiry = (key: string, ttlSeconds: number) => {
+    const ttlMs = Math.max(0, ttlSeconds * 1000);
+    expires.set(key, ttlSeconds);
+    expiryAt.set(key, now() + ttlMs);
+    expireDueKeys();
+  };
+
+  const setExpiryMs = (key: string, ttlMs: number) => {
+    expires.set(key, ttlMs / 1000);
+    expiryAt.set(key, now() + Math.max(0, ttlMs));
+    expireDueKeys();
+  };
+
+  const writeValue = (key: string, value: string, ttlSeconds?: number, ttlMs?: number) => {
+    redis.set(key, value);
+    if (ttlMs != null) setExpiryMs(key, ttlMs);
+    else if (ttlSeconds != null) setExpiry(key, ttlSeconds);
+    else clearExpiry(key);
+  };
+
+  const parseSetTtl = (options: Array<string | number>) => {
+    for (let index = 0; index < options.length; index++) {
+      const option = String(options[index]).toUpperCase();
+      if (option === 'EX') return { seconds: Number(options[index + 1] ?? 0) };
+      if (option === 'PX') return { milliseconds: Number(options[index + 1] ?? 0) };
+    }
+    return {};
+  };
 
   const upsertSortedSet = (key: string, score: number, member: string) => {
     const next = (sortedSets.get(key) ?? []).filter((item) => item.member !== member);
@@ -62,6 +126,7 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
       throw new Error(`Unexpected URL: ${url}`);
     }
 
+    expireDueKeys();
     const parsed = new URL(url);
     if (parsed.pathname.startsWith('/get/')) {
       const key = decodeURIComponent(parsed.pathname.slice('/get/'.length));
@@ -74,31 +139,44 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
       const parts = parsed.pathname.split('/');
       const key = decodeURIComponent(parts[2] || '');
       const value = decodeURIComponent(parts[3] || '');
-      redis.set(key, value);
+      writeValue(key, value);
       return new Response(JSON.stringify({ result: 'OK' }), { status: 200 });
     }
 
     if (parsed.pathname === '/') {
-      const command = JSON.parse(typeof init?.body === 'string' ? init.body : '[]') as string[];
+      const command = JSON.parse(typeof init?.body === 'string' ? init.body : '[]') as Array<string | number>;
       const [verb, key = '', value = ''] = command;
-      if (verb === 'SET') {
-        const opts = command
-          .slice(3)
-          .map(String)
-          .map((item) => item.toUpperCase());
-        if (opts.includes('NX') && redis.has(key)) {
+      const normalizedVerb = String(verb).toUpperCase();
+      const redisKey = String(key);
+      if (normalizedVerb === 'GET') {
+        return new Response(JSON.stringify({ result: redis.get(redisKey) ?? null }), { status: 200 });
+      }
+      if (normalizedVerb === 'SET') {
+        const options = command.slice(3);
+        const opts = options.map(String).map((item) => item.toUpperCase());
+        if (opts.includes('NX') && redis.has(redisKey)) {
           return new Response(JSON.stringify({ result: null }), {
             status: 200,
           });
         }
-        redis.set(key, value);
+        const ttl = parseSetTtl(options);
+        writeValue(redisKey, String(value), ttl.seconds, ttl.milliseconds);
         return new Response(JSON.stringify({ result: 'OK' }), { status: 200 });
       }
-      if (String(verb).toUpperCase() === 'EVAL') {
+      if (normalizedVerb === 'DEL') {
+        return new Response(JSON.stringify({ result: removeKey(redisKey) ? 1 : 0 }), { status: 200 });
+      }
+      if (normalizedVerb === 'EXPIRE') {
+        const ttlSeconds = Number(value);
+        if (!redis.has(redisKey)) return new Response(JSON.stringify({ result: 0 }), { status: 200 });
+        setExpiry(redisKey, ttlSeconds);
+        return new Response(JSON.stringify({ result: 1 }), { status: 200 });
+      }
+      if (normalizedVerb === 'EVAL') {
         const keyArg = String(command[3] ?? '');
         const expected = String(command[4] ?? '');
         if (redis.get(keyArg) === expected) {
-          redis.delete(keyArg);
+          removeKey(keyArg);
           return new Response(JSON.stringify({ result: 1 }), { status: 200 });
         }
         return new Response(JSON.stringify({ result: 0 }), { status: 200 });
@@ -106,7 +184,7 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
       throw new Error(`Unexpected POST / command: ${verb}`);
     }
 
-    if (parsed.pathname === '/pipeline') {
+    if (parsed.pathname === '/pipeline' || parsed.pathname === '/multi-exec') {
       const commands = JSON.parse(typeof init?.body === 'string' ? init.body : '[]') as Array<Array<string | number>>;
       const result = commands.map((command) => {
         const [verb, key = '', ...args] = command;
@@ -118,19 +196,18 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
         }
 
         if (normalizedVerb === 'SET') {
-          const opts = args
-            .slice(1)
-            .map(String)
-            .map((item) => item.toUpperCase());
+          const options = args.slice(1);
+          const opts = options.map(String).map((item) => item.toUpperCase());
           if (opts.includes('NX') && redis.has(redisKey)) {
             return { result: null };
           }
-          redis.set(redisKey, String(args[0] || ''));
+          const ttl = parseSetTtl(options);
+          writeValue(redisKey, String(args[0] || ''), ttl.seconds, ttl.milliseconds);
           return { result: 'OK' };
         }
 
         if (normalizedVerb === 'DEL') {
-          return { result: redis.delete(redisKey) ? 1 : 0 };
+          return { result: removeKey(redisKey) ? 1 : 0 };
         }
 
         if (normalizedVerb === 'INCR') {
@@ -145,6 +222,45 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
           const next = (Number.isFinite(current) ? current : 0) - 1;
           redis.set(redisKey, String(next));
           return { result: next };
+        }
+
+        if (normalizedVerb === 'EVAL') {
+          const keyCount = Number(command[2] ?? 0);
+          const script = String(command[1] ?? '');
+          if (Number.isInteger(keyCount) && keyCount > 0 && script.includes("ARGV[i] == ''")) {
+            const keys = command.slice(3, 3 + keyCount).map(String);
+            const argv = command.slice(3 + keyCount);
+            const dataKeyCount = keyCount - 1;
+            const dataTtl = Number(argv[keyCount] ?? 0);
+            const metaTtl = Number(argv[keyCount + 1] ?? 0);
+            for (let index = 0; index < dataKeyCount; index++) {
+              const value = String(argv[index] ?? '');
+              if (value === '') {
+                removeKey(keys[index]!);
+              } else {
+                writeValue(keys[index]!, value, dataTtl);
+              }
+            }
+            writeValue(keys[dataKeyCount]!, String(argv[dataKeyCount] ?? ''), metaTtl);
+            return { result: keyCount };
+          }
+          if (
+            !Number.isInteger(keyCount)
+            || keyCount < 0
+            || !script.includes("ARGV[#KEYS + i]")
+          ) {
+            throw new Error('Unexpected pipeline EVAL script');
+          }
+          const keys = command.slice(3, 3 + keyCount).map(String);
+          const values = command.slice(3 + keyCount, 3 + keyCount * 2).map(String);
+          const ttls = command.slice(3 + keyCount * 2, 3 + keyCount * 3).map(Number);
+          if (keys.length !== keyCount || values.length !== keyCount || ttls.length !== keyCount) {
+            throw new Error('Malformed atomic cache publish command');
+          }
+          for (let index = 0; index < keyCount; index++) {
+            writeValue(keys[index]!, values[index]!, ttls[index]!);
+          }
+          return { result: keyCount };
         }
 
         if (normalizedVerb === 'EVALSHA' || normalizedVerb === 'EVALSHA_RO') {
@@ -181,6 +297,16 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
           };
         }
 
+        if (normalizedVerb === 'ZREM') {
+          const members = new Set(args.map(String));
+          const before = (sortedSets.get(redisKey) ?? []).length;
+          sortedSets.set(
+            redisKey,
+            (sortedSets.get(redisKey) ?? []).filter((entry) => !members.has(entry.member)),
+          );
+          return { result: before - (sortedSets.get(redisKey) ?? []).length };
+        }
+
         if (normalizedVerb === 'ZREMRANGEBYRANK') {
           const before = (sortedSets.get(redisKey) ?? []).length;
           removeByRank(redisKey, Number(args[0] ?? 0), Number(args[1] ?? 0));
@@ -193,7 +319,8 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
         }
 
         if (normalizedVerb === 'EXPIRE') {
-          expires.set(redisKey, Number(args[0] ?? 0));
+          if (!redis.has(redisKey)) return { result: 0 };
+          setExpiry(redisKey, Number(args[0] ?? 0));
           return { result: 1 };
         }
 
@@ -208,11 +335,14 @@ export function createRedisFetch(fixtures: Record<string, unknown>): FakeRedisSt
   return { fetchImpl, redis, sortedSets, expires };
 }
 
-export function installRedis(fixtures: Record<string, unknown>, opts: { keepVercelEnv?: boolean } = {}): FakeRedisState {
+export function installRedis(
+  fixtures: Record<string, unknown>,
+  opts: FakeRedisOptions & { keepVercelEnv?: boolean } = {},
+): FakeRedisState {
   process.env.UPSTASH_REDIS_REST_URL = 'https://redis.example';
   process.env.UPSTASH_REDIS_REST_TOKEN = 'token';
   if (!opts.keepVercelEnv) delete process.env.VERCEL_ENV;
-  const state = createRedisFetch(fixtures);
+  const state = createRedisFetch(fixtures, opts);
   globalThis.fetch = state.fetchImpl;
   return state;
 }

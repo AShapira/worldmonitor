@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { dataFreshness } from '../src/services/data-freshness.ts';
+import { dataFreshness, getIntelligenceGaps } from '../src/services/data-freshness.ts';
 import {
   __resetHealthFreshnessForTests,
   HEALTH_CHECK_SOURCE_MAP,
@@ -22,6 +22,40 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe('health freshness ingestion', () => {
+  it('identifies the weather source and outage gap as NWS/ECCC/WMO SWIC coverage', async () => {
+    __resetHealthFreshnessForTests();
+    await refreshDataFreshnessFromHealth({
+      endpoint: '/api/health',
+      urlResolver: (path) => path,
+      fetchFn: async () => jsonResponse({
+        checkedAt: new Date().toISOString(),
+        checks: {
+          weatherAlerts: {
+            status: 'SEED_ERROR',
+            records: 0,
+            maxStaleMin: 45,
+          },
+        },
+      }),
+    });
+
+    const weatherGap = getIntelligenceGaps().find(gap => gap.source === 'weather');
+
+    assert.equal(dataFreshness.getSource('weather')?.name, 'Severe Weather Alerts (NWS, ECCC, WMO SWIC)');
+    assert.match(weatherGap?.message ?? '', /NWS, ECCC, or WMO SWIC/);
+
+    // The two assertions above are satisfied by DataFreshnessTracker's constructor alone:
+    // it pre-seeds every SOURCE_METADATA entry with `name` and status 'no_data', and
+    // getIntelligenceGaps() admits 'no_data' with a static per-source message. Without the
+    // two below, this test passes verbatim with the refreshDataFreshnessFromHealth() call
+    // above deleted — an inert fixture. Only a SEED_ERROR that actually routed through
+    // recordSeedHealth sets lastError, which calculateStatus turns into status 'error' and
+    // getIntelligenceGaps escalates to 'critical' (weather is requiredForRisk: false, so
+    // constructor state yields 'warning').
+    assert.equal(dataFreshness.getSource('weather')?.status, 'error');
+    assert.equal(weatherGap?.severity, 'critical');
+  });
+
   it('hydrates dataFreshness from /api/health cadence metadata', async () => {
     const checkedAtMs = Date.now();
     const applied = await refreshDataFreshnessFromHealth({
@@ -320,17 +354,87 @@ describe('health freshness ingestion', () => {
     assert.equal(gdelt?.healthStatus, 'STALE_SEED');
     assert.equal(gdelt?.itemCount, 6);
 
-    // weather maps from weatherAlerts, which is absent from `problems` — the
-    // server evaluated it and found it within budget. It must read fresh as of
-    // checkedAt, NOT no_data (a bare OK with no age would leave lastUpdate
-    // null and calculateStatus reports no_data).
     const weather = dataFreshness.getSource('weather');
     assert.equal(weather?.status, 'fresh');
     assert.equal(weather?.healthStatus, 'OK');
     assert.equal(weather?.lastUpdate?.toISOString(), new Date(checkedAtMs).toISOString());
   });
 
-  it('marks all mapped sources healthy on a compact payload with no problems key', async () => {
+  it('preserves stale content and its vintage from a pending-only compact payload', async () => {
+    __resetHealthFreshnessForTests();
+    const checkedAtMs = Date.now();
+    await refreshDataFreshnessFromHealth({
+      urlResolver: (path) => path,
+      fetchFn: async () => jsonResponse({
+        status: 'HEALTHY',
+        checkedAt: new Date(checkedAtMs).toISOString(),
+        pending: {
+          blsSeries: {
+            status: 'STALE_CONTENT', records: 9,
+            seedAgeMin: 1, maxStaleMin: 360,
+            contentAgeMin: 90, maxContentAgeMin: 60,
+          },
+        },
+      }),
+    });
+
+    const bls = dataFreshness.getSource('bls');
+    assert.equal(bls?.status, 'stale');
+    assert.equal(bls?.healthStatus, 'STALE_CONTENT');
+    assert.equal(bls?.itemCount, 9);
+    assert.equal(bls?.maxStaleMin, 60);
+    assert.equal(bls?.lastUpdate?.toISOString(), new Date(checkedAtMs - 90 * 60_000).toISOString());
+  });
+
+  it('prefers a compact problem over a duplicate pending check', async () => {
+    __resetHealthFreshnessForTests();
+    const checkedAtMs = Date.now();
+    await refreshDataFreshnessFromHealth({
+      urlResolver: (path) => path,
+      fetchFn: async () => jsonResponse({
+        status: 'DEGRADED',
+        checkedAt: new Date(checkedAtMs).toISOString(),
+        pending: {
+          weatherAlerts: { status: 'STALE_CONTENT', records: 2, contentAgeMin: 60, maxContentAgeMin: 45 },
+        },
+        problems: {
+          weatherAlerts: { status: 'STALE_SEED', records: 4, seedAgeMin: 90, maxStaleMin: 45 },
+        },
+      }),
+    });
+
+    const weather = dataFreshness.getSource('weather');
+    assert.equal(weather?.healthStatus, 'STALE_SEED');
+    assert.equal(weather?.itemCount, 4);
+    assert.equal(weather?.maxStaleMin, 45);
+    assert.equal(weather?.lastUpdate?.toISOString(), new Date(checkedAtMs - 90 * 60_000).toISOString());
+  });
+
+  it('keeps full checks authoritative over both compact maps', async () => {
+    __resetHealthFreshnessForTests();
+    const checkedAtMs = Date.now();
+    const applied = await refreshDataFreshnessFromHealth({
+      urlResolver: (path) => path,
+      fetchFn: async () => jsonResponse({
+        status: 'HEALTHY',
+        checkedAt: new Date(checkedAtMs).toISOString(),
+        checks: {
+          weatherAlerts: { status: 'OK', records: 3, seedAgeMin: 5, maxStaleMin: 45 },
+        },
+        pending: { weatherAlerts: { status: 'STALE_CONTENT' } },
+        problems: { weatherAlerts: { status: 'SEED_ERROR' }, gdeltIntel: { status: 'SEED_ERROR' } },
+      }),
+    });
+
+    assert.equal(applied, 1);
+    const weather = dataFreshness.getSource('weather');
+    assert.equal(weather?.status, 'fresh');
+    assert.equal(weather?.healthStatus, 'OK');
+    assert.equal(weather?.itemCount, 3);
+    assert.equal(weather?.lastUpdate?.toISOString(), new Date(checkedAtMs - 5 * 60_000).toISOString());
+  });
+
+  it('marks all mapped sources healthy on a compact payload with no problems or pending keys', async () => {
     __resetHealthFreshnessForTests();
     const mappedSources = new Set(Object.values(HEALTH_CHECK_SOURCE_MAP).flat());
     const checkedAtMs = Date.now();
@@ -399,5 +503,35 @@ describe('health freshness ingestion', () => {
       /scheduleAfterFirstPaint\(\(\)\s*=>\s*\{[\s\S]*?scheduleRefresh\(\s*['"]health-freshness['"][\s\S]*?refreshDataFreshnessFromHealth\(\)[\s\S]*?REFRESH_INTERVALS\.healthFreshness[\s\S]*?runImmediately:\s*true/,
       'App scheduler should hydrate health freshness at post-paint idle (never in the LCP window — #4907) and then on an interval, independent of panel visibility',
     );
+  });
+
+  it('renders server-crit and server-warn statuses as degraded, not fresh (#6780)', async () => {
+    __resetHealthFreshnessForTests();
+    const checkedAtMs = Date.now();
+    await refreshDataFreshnessFromHealth({
+      endpoint: '/api/health',
+      urlResolver: (path) => path,
+      fetchFn: async () => jsonResponse({
+        checkedAt: new Date(checkedAtMs).toISOString(),
+        checks: {
+          // Server-crit: must surface as an error even at a fresh seed age,
+          // instead of passing calculateStatus's age check as 'fresh'.
+          weatherAlerts: { status: 'CHINA_UNAVAILABLE', records: 5, seedAgeMin: 1, maxStaleMin: 45 },
+          // Server-warn degradation: fresh age but must render 'stale'.
+          gdeltIntel: { status: 'COVERAGE_DEGRADED', records: 10, seedAgeMin: 1, maxStaleMin: 420 },
+          // Server-ok: an intentionally-blocked source is NOT a degradation and
+          // must still render 'fresh' at a fresh age (guards a future edit from
+          // folding it in with the warn statuses next to it).
+          cyberThreats: { status: 'SOURCE_BLOCKED', records: 8, seedAgeMin: 1, maxStaleMin: 240 },
+        },
+      }),
+    });
+
+    // Before #6780 the first two rendered 'fresh' (green): CHINA_UNAVAILABLE was
+    // not an error predicate and COVERAGE_DEGRADED was not in the fresh-age stale
+    // set. SOURCE_BLOCKED must stay fresh in both the old and new behavior.
+    assert.equal(dataFreshness.getSource('weather')?.status, 'error');
+    assert.equal(dataFreshness.getSource('gdelt')?.status, 'stale');
+    assert.equal(dataFreshness.getSource('cyber_threats')?.status, 'fresh');
   });
 });

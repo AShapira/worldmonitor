@@ -122,7 +122,7 @@ vi.mock("../auth-session", () => ({
 import { createDomainGateway } from "../gateway";
 
 const REGULAR_PATH = "/api/news/v1/list-feed-digest";
-const PUBLIC_NO_AUTH_PATH = "/api/conflict/v1/list-acled-events"; // in PUBLIC_NO_AUTH_RPC_PATHS
+const PUBLIC_NO_AUTH_PATH = "/api/intelligence/v1/get-china-decision-signals"; // in PUBLIC_NO_AUTH_RPC_PATHS
 const PREMIUM_PATH = "/api/market/v1/analyze-stock"; // in PREMIUM_RPC_PATHS
 
 function ok() {

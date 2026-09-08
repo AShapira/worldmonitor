@@ -13,6 +13,7 @@ export interface ImportResult {
 
 import { CLOUD_SYNC_KEYS } from './sync-keys';
 import { invalidatePanelStorageCacheForKeys } from './panel-storage';
+import { safeStorageSnapshot } from './safe-storage';
 
 const MAX_IMPORT_SIZE_BYTES = 5 * 1024 * 1024;
 
@@ -27,6 +28,9 @@ const SETTINGS_KEY_PREFIXES: readonly string[] = [
   'worldmonitor-webcam-prefs',
   'wm-map-theme:',
   'map-height',
+  'map-split-height',
+  'map-col-width',
+  'map-side',
   'map-pinned',
   'mobile-map-collapsed',
   'positive-threshold',
@@ -36,20 +40,38 @@ function isSettingsKey(key: string): boolean {
   return SETTINGS_KEY_PREFIXES.some(prefix => key.startsWith(prefix));
 }
 
+export const __testing__ = { isSettingsKey };
+
 export function exportSettings(): void {
   const data: Record<string, string> = {};
 
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    if (!key || !isSettingsKey(key)) continue;
-    const value = localStorage.getItem(key);
-    if (value !== null) data[key] = value;
+  // Storage that cannot be read has no settings to export, and handing the
+  // user a downloadable file anyway is worse than failing: the caller in
+  // preferences-content.ts wraps this in try/catch and shows `exportSuccess`
+  // when it returns, so a silent empty payload becomes a green "Exported"
+  // toast over a backup containing nothing (#7833 review). Stay loud.
+  //
+  // Testing AVAILABILITY is not enough on its own, which an earlier round of
+  // this fix got wrong: a handle can exist while enumeration or an individual
+  // read throws, and the degrading accessors then return `[]`/`null` and
+  // rebuild exactly that empty-but-successful backup. The snapshot reports
+  // whether the reads themselves succeeded, so a partial one fails instead of
+  // shipping a backup the user would only discover was empty when restoring.
+  const snapshot = safeStorageSnapshot();
+  if (!snapshot.ok) {
+    throw new Error('Settings export could not read browser storage.');
+  }
+
+  let variant = 'full';
+  for (const [key, value] of snapshot.entries) {
+    if (key === 'worldmonitor-variant' && value) variant = value;
+    if (isSettingsKey(key)) data[key] = value;
   }
 
   const exportData: ExportedSettings = {
     version: 1,
     timestamp: new Date().toISOString(),
-    variant: localStorage.getItem('worldmonitor-variant') || 'full',
+    variant,
     data,
   };
 

@@ -19,6 +19,7 @@ const guardedPaths = [
   '/relay/entitlement',
   '/relay/register-referral-code',
   '/api/internal-validate-api-key',
+  '/api/internal-validate-embed-key',
   '/api/internal-get-key-owner',
   '/api/internal-issue-pro-mcp-token',
   '/api/internal-validate-pro-mcp-token',

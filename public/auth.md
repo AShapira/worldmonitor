@@ -1,22 +1,20 @@
 # WorldMonitor — Agent Authentication (auth.md)
 
-How agents authenticate with the WorldMonitor API and MCP server
-(`https://worldmonitor.app/mcp`), per the WorkOS **auth.md** spec:
-<https://workos.com/auth-md>. Discovery is open; data calls need a bearer token
-or API key.
+Use API keys or OAuth 2.1 to authenticate with the WorldMonitor API and MCP server.
+This walkthrough follows the WorkOS **auth.md** spec: <https://workos.com/auth-md>.
 
-**Before anything else — send a descriptive `User-Agent`** (e.g.
-`mytool/1.0 (+https://yoursite.example)`). Default HTTP-library UAs (`curl/*`,
-`python-requests/*`, empty/short strings) may be challenged with an HTML 403 by
-the edge firewall before your request reaches the API — a 403 does not mean the
-endpoint is missing or your credentials are wrong.
+Discovery is open. `get_sources` alone is credential- and daily-quota-free
+(10 anonymous calls/minute/IP, fail closed). Other MCP data tools need
+subscription credentials.
+
+Send a descriptive `User-Agent`, such as `mytool/1.0`. Default library values can receive a firewall 403.
 
 ## Discover
 
-Learn the auth requirements from one unauthenticated request, then follow the
-chain:
+Discover the authentication requirements:
 
-1. Call any data method without credentials; read the `WWW-Authenticate` header:
+1. Call any subscription-gated data method without credentials; read the
+   `WWW-Authenticate` header. (`get_sources` succeeds anonymously instead.)
 
    ```
    401 Unauthorized
@@ -31,7 +29,7 @@ chain:
    ```json
    { "issuer": "https://worldmonitor.app",
      "agent_auth": {
-       "skill": "https://worldmonitor.app/auth.md",
+       "skill": "https://www.worldmonitor.app/auth.md",
        "register_uri": "https://worldmonitor.app/oauth/register",
        "claim_uri": "https://worldmonitor.app/oauth/authorize",
        "identity_types_supported": ["anonymous"],
@@ -70,7 +68,7 @@ POST /oauth/register  {"client_name":"My Agent","redirect_uris":["https://claude
 
 `redirect_uris` are allowlisted (Claude callbacks + `http://localhost` /
 `http://127.0.0.1` on any port). Clients are public — no secret; use PKCE
-(`S256`). **API-key path:** start at <https://worldmonitor.app/pro>, then use
+(`S256`). **API-key path:** start at <https://www.worldmonitor.app/pro>, then use
 the signed-in dashboard's API Keys settings to self-issue or revoke keys — no
 registration call.
 
@@ -89,7 +87,8 @@ API keys the claim is implicit — the key belongs to its dashboard creator.
 
 ## Use the credential
 
-Exchange the code for a bearer token, then send it on every request:
+Exchange the code for a bearer token, then send it on every subscription-gated
+request:
 
 ```
 POST /oauth/token  grant_type=authorization_code&code=…&code_verifier=…&client_id=…
@@ -116,7 +115,7 @@ The same credentials authorize the REST API. Catalog:
 - **Expiry** — access tokens last 1 hour, refresh tokens 7 days; let them lapse
   to de-authorize an agent.
 - **User revoke** — a signed-in user revokes an agent from the dashboard's API
-  Keys or Connected MCP Clients settings; start at <https://worldmonitor.app/pro>.
+  Keys or Connected MCP Clients settings; start at <https://www.worldmonitor.app/pro>.
   The token is then rejected with `401`
   / `invalid_grant`.
 - **Refresh rotation** — refresh tokens rotate on every use with token-family

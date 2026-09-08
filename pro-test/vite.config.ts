@@ -1,7 +1,13 @@
+import { sentryVitePlugin } from '@sentry/vite-plugin';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import path from 'path';
 import { defineConfig } from 'vite';
+
+// Mirrors the root config's gate. WORLDMONITOR-11Y and -107 are marketing-bundle
+// events that arrived with zero usable frames, so covering only the dashboard
+// would leave this half of the surface unreadable.
+const uploadSourceMapsToSentry = Boolean(process.env.SENTRY_AUTH_TOKEN);
 
 const STATIC_SCRIPT_NONCE = 'wm-static-bootstrap';
 
@@ -15,12 +21,45 @@ function isWelcomeHydrationPreload(dep: string) {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [
+    react(),
+    tailwindcss(),
+    ...(uploadSourceMapsToSentry
+      ? [sentryVitePlugin({
+          org: 'elie-habib',
+          project: 'worldmonitor',
+          authToken: process.env.SENTRY_AUTH_TOKEN,
+          telemetry: false,
+          sourcemaps: {
+            // This bundle emits into ../public/pro, which the root build copies
+            // wholesale into dist — a leftover map would ship publicly whatever
+            // the root's preview flag says. Always sweep them, so public output
+            // stays exactly as it is today (no marketing maps served).
+            filesToDeleteAfterUpload: ['../public/pro/**/*.map'],
+          },
+        })]
+      : []),
+  ],
   base: '/pro/',
+  // Local WebMCP testing uses chrome://flags/#enable-webmcp-testing instead of
+  // an origin-trial token. Keep the browser security gates aligned with the
+  // production homepage so the flag-based smoke exercises the real boundary.
+  server: {
+    headers: {
+      'Origin-Agent-Cluster': '?1',
+      'Permissions-Policy': 'tools=(self)',
+    },
+  },
   html: {
     cspNonce: STATIC_SCRIPT_NONCE,
   },
   build: {
+    // Built only to be uploaded; filesToDeleteAfterUpload removes them again.
+    sourcemap: uploadSourceMapsToSentry,
+    // @clerk/clerk-js ships as one monolithic vendor SDK (~3MB) that can't be
+    // split further; it's already dynamically imported (services/clerk.ts)
+    // so it never loads on first paint. Raise the warning threshold to match.
+    chunkSizeWarningLimit: 3500,
     modulePreload: {
       resolveDependencies: (filename, deps, context) => {
         if (context.hostType !== 'html') return deps;

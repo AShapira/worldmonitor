@@ -7,6 +7,8 @@ import {
   getServerInsights,
   __resetServerInsightsCacheForTests,
 } from '../src/services/insights-loader';
+import { __testing__ as bootstrapTesting } from '../src/services/bootstrap';
+import { insightsSnapshotRejection } from '../shared/insights-snapshot.js';
 
 describe('insights-loader', () => {
   describe('MAX_AGE_MS — server-cadence-aligned freshness window', () => {
@@ -23,63 +25,88 @@ describe('insights-loader', () => {
     });
   });
 
-  describe('getServerInsights (logic validation)', () => {
-    function isFresh(generatedAt) {
-      const age = Date.now() - new Date(generatedAt).getTime();
-      return age < MAX_AGE_MS;
-    }
-
-    it('rejects data older than the freshness window', () => {
-      const old = new Date(Date.now() - MAX_AGE_MS - 60_000).toISOString();
-      assert.equal(isFresh(old), false);
+  // These asserted against a local isFresh copy and against object literals
+  // the test had just written ("assert.equal(degraded.worldBrief, '')" on a
+  // literal ''), so neither block could fail. Both gates live in the shared
+  // validator, which names the reason it rejects.
+  describe('insightsSnapshotRejection — freshness gate', () => {
+    const now = Date.parse('2026-09-05T12:00:00.000Z');
+    const snapshotAt = (ageMs) => ({
+      topStories: [{ primaryTitle: 'Test', sourceCount: 2 }],
+      generatedAt: new Date(now - ageMs).toISOString(),
     });
 
-    it('accepts data younger than the freshness window', () => {
-      const fresh = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-      assert.equal(isFresh(fresh), true);
+    it('accepts a snapshot generated now', () => {
+      assert.equal(insightsSnapshotRejection(snapshotAt(0), now), null);
     });
 
-    it('accepts data from now', () => {
-      assert.equal(isFresh(new Date().toISOString()), true);
+    it('accepts a snapshot inside the window', () => {
+      assert.equal(insightsSnapshotRejection(snapshotAt(5 * 60 * 1000), now), null);
     });
 
-    it('rejects exactly window-aged data', () => {
-      const exact = new Date(Date.now() - MAX_AGE_MS).toISOString();
-      assert.equal(isFresh(exact), false);
+    it('rejects a snapshot exactly the window old', () => {
+      assert.equal(insightsSnapshotRejection(snapshotAt(MAX_AGE_MS), now), 'stale-snapshot');
+    });
+
+    it('rejects a snapshot past the window', () => {
+      assert.equal(insightsSnapshotRejection(snapshotAt(MAX_AGE_MS + 60_000), now), 'stale-snapshot');
+    });
+
+    it('rejects a snapshot generated in the future', () => {
+      assert.equal(insightsSnapshotRejection(snapshotAt(-60_000), now), 'future-generated-at');
     });
   });
 
-  describe('ServerInsights payload shape', () => {
-    it('validates required fields', () => {
-      const valid = {
+  describe('insightsSnapshotRejection — payload shape gate', () => {
+    const now = Date.parse('2026-09-05T12:00:00.000Z');
+    const generatedAt = new Date(now).toISOString();
+
+    it('accepts a full payload', () => {
+      assert.equal(insightsSnapshotRejection({
         worldBrief: 'Test brief',
         worldBriefSources: [{ title: 'Test', source: 's', url: 'https://example.com/test' }],
         briefProvider: 'groq',
         status: 'ok',
         topStories: [{ primaryTitle: 'Test', sourceCount: 2 }],
-        generatedAt: new Date().toISOString(),
+        generatedAt,
         clusterCount: 10,
         multiSourceCount: 5,
         fastMovingCount: 3,
-      };
-      assert.ok(valid.topStories.length >= 1);
-      assert.ok(['ok', 'degraded'].includes(valid.status));
+      }, now), null);
     });
 
-    it('allows degraded status with empty brief', () => {
-      const degraded = {
+    it('accepts a degraded payload with an empty brief', () => {
+      assert.equal(insightsSnapshotRejection({
         worldBrief: '',
         status: 'degraded',
         topStories: [{ primaryTitle: 'Test' }],
-        generatedAt: new Date().toISOString(),
-      };
-      assert.equal(degraded.worldBrief, '');
-      assert.equal(degraded.status, 'degraded');
+        generatedAt,
+      }, now), null);
     });
 
     it('rejects empty topStories', () => {
-      const empty = { topStories: [] };
-      assert.equal(empty.topStories.length >= 1, false);
+      assert.equal(insightsSnapshotRejection({ topStories: [], generatedAt }, now), 'malformed-snapshot');
+    });
+
+    it('rejects a payload with no topStories array', () => {
+      assert.equal(insightsSnapshotRejection({ generatedAt }, now), 'malformed-snapshot');
+    });
+
+    it('rejects a non-object payload', () => {
+      assert.equal(insightsSnapshotRejection(null, now), 'malformed-snapshot');
+    });
+
+    it('rejects a payload with no generatedAt', () => {
+      assert.equal(insightsSnapshotRejection({
+        topStories: [{ primaryTitle: 'Test' }],
+      }, now), 'missing-generated-at');
+    });
+
+    it('rejects an unparseable generatedAt', () => {
+      assert.equal(insightsSnapshotRejection({
+        topStories: [{ primaryTitle: 'Test' }],
+        generatedAt: 'not-a-date',
+      }, now), 'missing-generated-at');
     });
   });
 
@@ -106,11 +133,14 @@ describe('insights-loader', () => {
 
     beforeEach(() => {
       __resetServerInsightsCacheForTests();
+      bootstrapTesting.resetBootstrapForTests();
       originalFetch = globalThis.fetch;
     });
 
     afterEach(() => {
       globalThis.fetch = originalFetch;
+      __resetServerInsightsCacheForTests();
+      bootstrapTesting.resetBootstrapForTests();
     });
 
     it('REGRESSION: recovers when getServerInsights() returns null because bootstrap hydration is missing', async () => {
@@ -182,6 +212,242 @@ describe('insights-loader', () => {
         new Response(JSON.stringify({ data: { insights: stale } }), { status: 200 });
       const result = await fetchServerInsights();
       assert.equal(result, null);
+    });
+
+    it('keeps the coalesced fetch alive for the longest caller budget (#7293)', async () => {
+      // ProActivationInterstitial starts with 2500 ms; InsightsPanel and
+      // ThreatTimelinePanel use the 5000 ms default. Sharing inFlight must
+      // not pin the abort to the first (shorter) caller.
+      const valid = makeValidInsights();
+      let fetchCount = 0;
+      let release;
+      const hold = new Promise((resolve) => { release = resolve; });
+      globalThis.fetch = async (_url, init) => {
+        fetchCount += 1;
+        const signal = init?.signal;
+        await Promise.race([
+          hold,
+          new Promise((_, reject) => {
+            const fail = () => {
+              const err = new Error('aborted');
+              err.name = signal?.reason?.name || 'AbortError';
+              reject(err);
+            };
+            if (!signal) return;
+            if (signal.aborted) {
+              fail();
+              return;
+            }
+            signal.addEventListener('abort', fail, { once: true });
+          }),
+        ]);
+        return new Response(JSON.stringify({ data: { insights: valid } }), { status: 200 });
+      };
+
+      const short = fetchServerInsights(40);
+      await Promise.resolve();
+      const long = fetchServerInsights(200);
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      release();
+      const [shortResult, longResult] = await Promise.all([short, long]);
+      assert.equal(fetchCount, 1, 'overlapping callers still share one request');
+      assert.equal(longResult?.worldBrief, 'Test brief', 'the 200ms caller must survive the first caller\'s 40ms abort');
+      assert.equal(shortResult, longResult);
+    });
+
+    it('does not shrink an in-flight abort when a shorter caller joins (#7293)', async () => {
+      const valid = makeValidInsights();
+      let fetchCount = 0;
+      let release;
+      const hold = new Promise((resolve) => { release = resolve; });
+      globalThis.fetch = async (_url, init) => {
+        fetchCount += 1;
+        const signal = init?.signal;
+        await Promise.race([
+          hold,
+          new Promise((_, reject) => {
+            const fail = () => {
+              const err = new Error('aborted');
+              err.name = signal?.reason?.name || 'AbortError';
+              reject(err);
+            };
+            if (!signal) return;
+            if (signal.aborted) {
+              fail();
+              return;
+            }
+            signal.addEventListener('abort', fail, { once: true });
+          }),
+        ]);
+        return new Response(JSON.stringify({ data: { insights: valid } }), { status: 200 });
+      };
+
+      const long = fetchServerInsights(200);
+      await Promise.resolve();
+      const short = fetchServerInsights(40);
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      release();
+      const [longResult, shortResult] = await Promise.all([long, short]);
+      assert.equal(fetchCount, 1);
+      assert.equal(longResult?.worldBrief, 'Test brief');
+      assert.equal(shortResult, longResult);
+    });
+
+    it('still aborts a solo insights fetch at its own timeout (#7293)', async () => {
+      let aborted = false;
+      globalThis.fetch = async (_url, init) => {
+        await new Promise((_, reject) => {
+          const signal = init?.signal;
+          const fail = () => {
+            aborted = true;
+            const err = new Error('aborted');
+            err.name = signal?.reason?.name || 'AbortError';
+            reject(err);
+          };
+          if (!signal) return;
+          if (signal.aborted) {
+            fail();
+            return;
+          }
+          signal.addEventListener('abort', fail, { once: true });
+        });
+      };
+      const result = await fetchServerInsights(30);
+      assert.equal(result, null);
+      assert.equal(aborted, true);
+    });
+
+    it('coalesces concurrent fetches into one network request (#7290)', async () => {
+      const valid = makeValidInsights();
+      let fetchCount = 0;
+      let release;
+      const hold = new Promise((resolve) => { release = resolve; });
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        await hold;
+        return new Response(JSON.stringify({ data: { insights: valid } }), { status: 200 });
+      };
+
+      const pending = [
+        fetchServerInsights(),
+        fetchServerInsights(),
+        fetchServerInsights(),
+      ];
+      release();
+      const [first, second, third] = await Promise.all(pending);
+      assert.equal(fetchCount, 1, 'concurrent callers must share one in-flight request');
+      assert.equal(first?.worldBrief, 'Test brief');
+      assert.equal(second, first);
+      assert.equal(third, first);
+    });
+
+    it('does not latch a settled network failure — a later call retries (#7290)', async () => {
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response('upstream down', { status: 503 });
+      };
+      assert.equal(await fetchServerInsights(), null);
+      assert.equal(await fetchServerInsights(), null);
+      assert.equal(fetchCount, 2, 'in-flight lock must clear on settle so a later caller can retry');
+    });
+
+    it('does not latch a null hydration slot — a later fetch may recover (#7290)', async () => {
+      // populateCache skips null, so this seeds an empty slot the same way
+      // production getHydratedData returns undefined. The panel harness stub
+      // that returns null is covered by tests/threat-timeline-panel.test.mts.
+      bootstrapTesting.seedHydrationCacheForTests({ insights: null });
+      const valid = makeValidInsights();
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({ data: { insights: valid } }), { status: 200 });
+      };
+
+      assert.equal(getServerInsights(), null, 'null is not a valid snapshot');
+      const fetched = await fetchServerInsights();
+      assert.equal(fetched?.worldBrief, 'Test brief');
+      assert.equal(fetchCount, 1, 'an empty/null slot must still open ?keys=insights');
+    });
+
+    it('recovers from stale persistent hydration with one coalesced refetch (#7290)', async () => {
+      // Persistent FAST-tier cache is 24h; insights freshness is 1h. A drained
+      // stale snapshot must not skip the credentialed no-store ?keys=insights
+      // recovery, but the three boot consumers must share that one request.
+      const stale = {
+        ...makeValidInsights(),
+        generatedAt: new Date(Date.now() - MAX_AGE_MS - 60_000).toISOString(),
+      };
+      const fresh = makeValidInsights();
+      bootstrapTesting.seedHydrationCacheForTests({ insights: stale });
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({ data: { insights: fresh } }), { status: 200 });
+      };
+
+      assert.equal(getServerInsights(), null, 'stale hydration must not be promoted');
+      const [first, second, third] = await Promise.all([
+        fetchServerInsights(),
+        fetchServerInsights(),
+        fetchServerInsights(),
+      ]);
+      assert.equal(first?.worldBrief, 'Test brief');
+      assert.equal(second, first);
+      assert.equal(third, first);
+      assert.equal(fetchCount, 1, 'invalid hydration may recover via one coalesced ?keys=insights fetch');
+    });
+
+    it('does not issue one network request per consumer after invalid hydration (#7290)', async () => {
+      bootstrapTesting.seedHydrationCacheForTests({
+        insights: { ...makeValidInsights(), topStories: [] },
+      });
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response(JSON.stringify({ data: { insights: makeValidInsights() } }), { status: 200 });
+      };
+
+      assert.equal(getServerInsights(), null, 'invalid hydration must not be promoted');
+      const [first, second, third] = await Promise.all([
+        fetchServerInsights(),
+        fetchServerInsights(),
+        fetchServerInsights(),
+      ]);
+      assert.equal(first?.worldBrief, 'Test brief');
+      assert.equal(second, first);
+      assert.equal(third, first);
+      assert.equal(fetchCount, 1, 'shape-invalid hydration still gets one coalesced recovery fetch');
+    });
+
+    it('consumes a valid FAST-tier hydration payload without a per-key fetch (#7290)', async () => {
+      const valid = makeValidInsights();
+      bootstrapTesting.seedHydrationCacheForTests({ insights: valid });
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response('should not run', { status: 500 });
+      };
+
+      const first = getServerInsights();
+      assert.equal(first?.worldBrief, 'Test brief');
+      assert.equal(getServerInsights(), first, 'later readers must reuse the module cache, not re-drain');
+      assert.equal(await fetchServerInsights(), first);
+      assert.equal(fetchCount, 0, 'accepted FAST-tier hydration must not fall through to ?keys=insights');
+    });
+
+    it('fetchServerInsights consumes unused hydration before opening a network request (#7290)', async () => {
+      const valid = makeValidInsights();
+      bootstrapTesting.seedHydrationCacheForTests({ insights: valid });
+      let fetchCount = 0;
+      globalThis.fetch = async () => {
+        fetchCount += 1;
+        return new Response('should not run', { status: 500 });
+      };
+
+      const fetched = await fetchServerInsights();
+      assert.equal(fetched?.worldBrief, 'Test brief');
+      assert.equal(fetchCount, 0, 'the first fetch path is also a hydration reader');
     });
   });
 });

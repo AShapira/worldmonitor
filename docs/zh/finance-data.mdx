@@ -21,6 +21,8 @@ description: "World Monitor 金融变体中的市场雷达、海湾国家 FDI �
 | 市场报价 | `GET /api/market/v1/list-market-quotes` | 市场面板、可自定义自选列表、股票 / 指数报价。 |
 | 加密货币报价 | `GET /api/market/v1/list-crypto-quotes` | 加密货币面板默认值；bootstrap 优先经由 `cryptoQuotes`。 |
 | 大宗商品报价 | `GET /api/market/v1/list-commodity-quotes` | 大宗商品、能源风险 Brent 磁贴、黄金 / 原油自选列表；bootstrap 优先经由 `commodityQuotes`。 |
+| 实物贵金属溢价 | `GET /api/market/v1/get-physical-premiums` | SGE SHAU/SHAG 基准价与 COMEX `GC=F`/`SI=F` 快照的比较。 |
+| 实物贵金属背离 | `GET /api/market/v1/get-physical-divergence-index` | 有界历史、稳健归一化、混合状态、5 日和 20 日趋势、明确数据状态及 70/30 综合指数。详见[方法](/zh/methodology/physical-divergence-index)。 |
 | 板块汇总 | `GET /api/market/v1/get-sector-summary` | 板块热力图与估值背景；bootstrap 优先经由 `sectors`。 |
 | 稳定币市场 | `GET /api/market/v1/list-stablecoin-markets` | 稳定币锚定健康面板；bootstrap 优先经由 `stablecoinMarkets`。 |
 | ETF 资金流 | `GET /api/market/v1/list-etf-flows` | BTC 现货 ETF 追踪器；bootstrap 优先经由 `etfFlows`。 |
@@ -149,7 +151,19 @@ Finance 变体包含一个精选数据库,记录了沙特阿拉伯和阿联酋�
 | 0.5% – 1.0% | SLIGHT DEPEG | 黄色       |
 | > 1.0%      | DEPEGGED     | 红色       |
 
-面板聚合稳定币总市值、24 小时成交量和整体健康状态(HEALTHY / CAUTION / WARNING)。`coins` 查询参数接受逗号分隔的 CoinGecko ID 列表,通过 `[a-z0-9-]+` 正则验证以防止注入。
+面板聚合稳定币总市值、24 小时成交量和整体健康状态(HEALTHY / CAUTION / WARNING)。
+
+`coins` 查询参数用于选择返回哪些稳定币。重复形式(`?coins=tether&coins=dai`)与逗号连接形式(`?coins=tether,dai`)等价。ID 会被去除空白、转为小写、去重,并通过 `^[a-z0-9][a-z0-9-]{0,63}$` 验证;单次请求最多 25 个 ID。
+
+不带参数与带参数的请求开销不同,这是有意为之:
+
+- **`coins` 为空**:从缓存快照返回五种默认稳定币,绝不调用上游服务商。
+- **指定 ID**:优先由该快照作答;只有快照未包含的 ID(包括默认五种之外的稳定币)才会访问 CoinGecko,且合并为一次批量请求,受限流保护并单独缓存。
+
+汇总统计基于实际返回的币种重新计算,因此子集请求描述的就是该子集。两个响应字段报告覆盖情况:
+
+- `dataStatus` —— `OK`、`PARTIAL` 或 `UNAVAILABLE`。它表示数据覆盖情况;`summary.healthStatus` 表示锚定健康状况,二者相互独立。
+- `unresolved` —— 每个请求了但未出现在响应中的 ID 各一条,并附原因:`INVALID_ID`(不符合 CoinGecko ID 格式)、`OVER_CAP`(超出 25 个 ID 上限,从未查询)、`NOT_FOUND`(服务商已应答,确无此币)或 `PROVIDER_ERROR`(查询失败,因此该 ID 是未知而非不存在)。
 
 ### BTC ETF 资金流向估算
 
@@ -219,7 +233,7 @@ Finance 变体包含一个精选数据库,记录了沙特阿拉伯和阿联酋�
 
 供应链面板跨三个互补维度提供对全球物流风险的实时可见性 —— 战略咽喉要道健康状况、运输成本趋势和关键矿产集中度 —— 从而能够及早发现会级联演变为经济和地缘政治后果的中断事件。
 
-**咽喉要道标签页** —— 通过交叉比对实时航行警告与 AIS 船舶中断数据,监控 9 条战略水道(苏伊士运河、马六甲海峡、霍尔木兹海峡、曼德海峡、巴拿马运河、台湾海峡、直布罗陀海峡、博斯普鲁斯海峡、达达尼尔海峡)。每个咽喉要道获得一个中断评分(0–100),由三部分公式计算得出:基线威胁等级(战区 / 关键 / 高 / 较高 / 正常)、活跃警告数量(有上限贡献)和 AIS 拥堵严重程度 —— 映射为颜色编码的状态指示器(绿/黄/红)。咽喉要道识别使用文本证据匹配(以主要术语和区域术语进行关键词评分),然后才回退到地理邻近度,以防将提及某一咽喉要道但地理上更接近另一咽喉要道的事件错误分类。数据缓存 TTL 为 5 分钟,以实现近实时感知。
+**咽喉要道标签页。** 该标签页监控已登记的战略水道，包括苏伊士运河、马六甲海峡、霍尔木兹海峡、曼德海峡、巴拿马运河、台湾海峡、直布罗陀海峡、博斯普鲁斯海峡和达达尼尔海峡。它交叉比对实时航行警告与 AIS 船舶中断数据。每个咽喉要道获得一个 0 到 100 的中断评分。评分有四项输入：地缘政治威胁基线权重、活跃 NGA 航行警告、AIS 拥堵严重度，以及 PortWatch 每日通行量在高威胁条件下急剧下降时的通行异常加分。仅当 PortWatch 每日通行历史比之前 30 天基线下降至少 50%，且威胁等级为 `war_zone` 或 `critical` 时，异常加分才增加 10 分。AIS 事件计数、中继通行计数和 PortWatch 周环比变动仅作背景信息。它们不改变评分。评分映射为绿色、黄色或红色状态。咽喉要道识别先使用文本证据匹配，并对主要术语和区域术语进行关键词评分。它仅在该匹配没有结果时使用地理邻近度。此顺序可防止提及一个咽喉要道的事件错误匹配到距离更近的另一个咽喉要道。数据缓存 TTL 为 5 分钟。
 
 **运输费率标签页** —— 跟踪两个美联储经济数据(FRED)序列:深海货运生产者价格指数(`PCU483111483111`)和货运运输服务指数(`TSIFRGHT`)。统计尖峰检测将异常价格变动与近期历史进行对比标记。内联 SVG sparklines 一目了然地呈现 24 个月的费率历史。缓存 1 小时,以反映底层数据的每周发布节奏。
 

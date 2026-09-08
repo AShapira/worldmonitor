@@ -1,3 +1,17 @@
+/**
+ * Every variant a user can switch to. One desktop binary ships and switches
+ * between all of these in-app (#5908), so this list is also the set
+ * `/api/download` accepts — `tests/desktop-one-binary-model.test.mjs` fails if
+ * the two drift apart.
+ */
+export const SITE_VARIANTS = ['full', 'tech', 'finance', 'happy', 'commodity', 'energy'] as const;
+
+export type SiteVariant = (typeof SITE_VARIANTS)[number];
+
+export function isSiteVariant(value: string | null | undefined): value is SiteVariant {
+  return typeof value === 'string' && (SITE_VARIANTS as readonly string[]).includes(value);
+}
+
 const buildVariant = (() => {
   try {
     return import.meta.env.VITE_VARIANT || 'full';
@@ -20,11 +34,14 @@ export const SITE_VARIANT: string = (() => {
   const isTauri = '__TAURI_INTERNALS__' in window || '__TAURI__' in window;
   if (isTauri) {
     const stored = loadStoredVariant();
-    if (stored === 'tech' || stored === 'full' || stored === 'finance' || stored === 'happy' || stored === 'commodity' || stored === 'energy') return stored;
+    if (isSiteVariant(stored)) return stored;
     return buildVariant;
   }
 
-  const h = location.hostname;
+  // window.location, not bare `location`: node-based tests stub `window`
+  // without a global `location`, and this module must stay importable there.
+  const h = window.location?.hostname;
+  if (!h) return buildVariant;
   if (h.startsWith('tech.')) return 'tech';
   if (h.startsWith('finance.')) return 'finance';
   if (h.startsWith('happy.')) return 'happy';
@@ -33,7 +50,7 @@ export const SITE_VARIANT: string = (() => {
 
   if (h === 'localhost' || h === '127.0.0.1') {
     const stored = loadStoredVariant();
-    if (stored === 'tech' || stored === 'full' || stored === 'finance' || stored === 'happy' || stored === 'commodity' || stored === 'energy') return stored;
+    if (isSiteVariant(stored)) return stored;
     return buildVariant;
   }
 

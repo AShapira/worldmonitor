@@ -1,4 +1,5 @@
 import { isDesktopRuntime } from './runtime';
+import { safeStorageSet } from '@/utils/safe-storage';
 import { invokeTauri } from './tauri-bridge';
 
 export type RuntimeSecretKey =
@@ -240,7 +241,7 @@ export const RUNTIME_FEATURES: RuntimeFeatureDefinition[] = [
   {
     id: 'finnhubMarkets',
     name: 'Finnhub market data',
-    description: 'Real-time stock quotes and market data from Finnhub.',
+    description: 'Delayed or seeded stock quotes via Finnhub when configured. A key is not a live tape.',
     requiredSecrets: ['FINNHUB_API_KEY'],
     fallback: 'Stock ticker uses limited free data.',
   },
@@ -454,7 +455,7 @@ export function getEffectiveSecrets(feature: RuntimeFeatureDefinition): RuntimeS
 
 export function setFeatureToggle(featureId: RuntimeFeatureId, enabled: boolean): void {
   runtimeConfig.featureToggles[featureId] = enabled;
-  localStorage.setItem(TOGGLES_STORAGE_KEY, JSON.stringify(runtimeConfig.featureToggles));
+  safeStorageSet(TOGGLES_STORAGE_KEY, JSON.stringify(runtimeConfig.featureToggles));
   notifyConfigChanged();
 }
 

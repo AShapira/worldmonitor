@@ -27,6 +27,19 @@ const LOCK_TTL_MS = 20 * 60 * 1000; // 20 min
 const MIN_COUNTRIES = 60;
 const MIN_COUNT_RATIO = 0.75; // abort if new count < 75% of previous
 
+export function isEmberCountDrop(newCount, previousMeta) {
+  return Boolean(
+    previousMeta
+    && typeof previousMeta === 'object'
+    && previousMeta.recordCount > 0
+    && newCount < previousMeta.recordCount * MIN_COUNT_RATIO
+  );
+}
+
+export function getPipelineFailures(results) {
+  return results.filter((result) => result?.error || result?.result === 'ERR');
+}
+
 function parseDelimitedRow(line, delimiter) {
   const cells = [];
   let current = '';
@@ -116,7 +129,12 @@ export function parseEmberCsv(csvText) {
   const rows = parseDelimitedText(csvText, ',');
   if (rows.length === 0) throw new Error('Ember CSV: no data rows');
 
-  // Schema sentinel — abort if Fossil series is missing entirely
+  const headers = Object.keys(rows[0] || {});
+  const missingColumns = Object.values(COLS).filter((column) => !headers.includes(column));
+  if (missingColumns.length > 0) {
+    throw new Error(`Ember CSV missing mapped columns: ${missingColumns.join(', ')}`);
+  }
+
   const hasFossil = rows.some((r) => String(r[COLS.series] || '').trim() === 'Fossil');
   if (!hasFossil) {
     throw new Error('Ember CSV schema changed — "Fossil" series not found; update parser');
@@ -243,7 +261,7 @@ async function redisGet(key) {
   return data.result ? unwrapEnvelope(JSON.parse(data.result)).data : null;
 }
 
-async function preservePreviousSnapshot(errorMsg, stashedAllMap = null, newCountryKeys = null, dataWritten = false) {
+export async function preservePreviousSnapshot(errorMsg, stashedAllMap = null, newCountryKeys = null, dataWritten = false) {
   console.error('[EmberElectricity] Preserving previous snapshot:', errorMsg);
 
   const existingMeta = await redisGet(EMBER_META_KEY).catch(() => null);
@@ -332,12 +350,10 @@ export async function main() {
 
     // Count-drop guard: abort if new count < 75% of previous
     const prevMeta = await redisGet(EMBER_META_KEY).catch(() => null);
-    if (prevMeta && typeof prevMeta === 'object' && prevMeta.recordCount > 0) {
-      if (countries.size < prevMeta.recordCount * MIN_COUNT_RATIO) {
-        throw new Error(
-          `Ember: country count dropped from ${prevMeta.recordCount} to ${countries.size} (<75% threshold) — aborting`,
-        );
-      }
+    if (isEmberCountDrop(countries.size, prevMeta)) {
+      throw new Error(
+        `Ember: country count dropped from ${prevMeta.recordCount} to ${countries.size} (<75% threshold) — aborting`,
+      );
     }
 
     newCountryKeys = new Set(countries.keys());
@@ -381,7 +397,7 @@ export async function main() {
     }
 
     const dataResults = await redisPipeline(dataCommands);
-    const dataFailures = dataResults.filter((r) => r?.error || r?.result === 'ERR');
+    const dataFailures = getPipelineFailures(dataResults);
     if (dataFailures.length > 0) {
       throw new Error(
         `Redis pipeline: ${dataFailures.length}/${dataCommands.length} data commands failed`,
@@ -405,8 +421,16 @@ export async function main() {
 }
 
 if (process.argv[1]?.endsWith('seed-ember-electricity.mjs')) {
-  main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+  // Terminal success marker. Emitted from .then() so it can ONLY print after main() has fully
+  // resolved — a throw anywhere inside, including a late publish step, skips it. Any marker
+  // written INSIDE main() would print before later work and could vouch for a run that then
+  // died (exactly how #6092 stayed invisible). Format mirrors runSeed() so the crash
+  // diagnostic recognises it; without it a clean run is indistinguishable from a silent death.
+  const __runStartedAt = Date.now();
+  main()
+    .then(() => console.log(`\n=== Done (${Date.now() - __runStartedAt}ms) ===`))
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
 }

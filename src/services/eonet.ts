@@ -2,7 +2,7 @@ import type { NaturalEvent, NaturalEventCategory } from '@/types';
 import { getRpcBaseUrl } from '@/services/rpc-client';
 import { NATURAL_EVENT_CATEGORIES } from '@/types';
 import type { ListNaturalEventsResponse } from '@/generated/client/worldmonitor/natural/v1/service_client';
-import { createCircuitBreaker } from '@/utils';
+import { createCircuitBreaker } from '@/utils/circuit-breaker';
 import { getHydratedData } from '@/services/bootstrap';
 import { NaturalServiceClient } from '@/services/generated-rpc-clients';
 
@@ -38,7 +38,9 @@ const breaker = createCircuitBreaker<ListNaturalEventsResponse>({ name: 'Natural
 
 const emptyFallback: ListNaturalEventsResponse = { events: [], fetchedAt: 0, dataAvailable: false };
 
-function toNaturalEvent(e: ListNaturalEventsResponse['events'][number]): NaturalEvent {
+/** Exported for the embed loader, which receives this wire shape from the
+ *  composed map-frame endpoint rather than from this module's own fetch. */
+export function toNaturalEvent(e: ListNaturalEventsResponse['events'][number]): NaturalEvent {
   return {
     id: e.id,
     title: e.title,
@@ -77,7 +79,12 @@ function toNaturalEvent(e: ListNaturalEventsResponse['events'][number]): Natural
 
 export async function fetchNaturalEvents(_days = 30): Promise<NaturalEvent[]> {
   const hydrated = getHydratedData('naturalEvents') as ListNaturalEventsResponse | undefined;
-  const response = (hydrated?.events?.length ? hydrated : null) ?? await breaker.execute(async () => {
+  if (hydrated?.events?.length) {
+    breaker.recordSuccess(hydrated);
+    return hydrated.events.map(toNaturalEvent);
+  }
+
+  const response = await breaker.execute(async () => {
     return client.listNaturalEvents({ days: 30 });
   }, emptyFallback, { shouldCache: (r) => r.events.length > 0 });
 

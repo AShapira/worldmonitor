@@ -2,7 +2,9 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { computeStats, validateCategoryExplainerCopy } from '../scripts/docs-stats.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '..');
@@ -21,6 +23,66 @@ function parsePost(file) {
 }
 
 const posts = postFiles.map(parsePost);
+
+const RESTRICTED_VENDOR_PRICE_ALLOWLIST = new Map();
+const UNSUPPORTED_VENDOR_PRICE_SOURCE = String.raw`(?:\$\s*\d[\d,.]*(?:[KM])?\+?|\b\d[\d,.]*(?:[KM])\b\+?|multi[- ]?million|six[- ]?figures?)`;
+const UNSUPPORTED_VENDOR_PRICE_TERMS = new RegExp(UNSUPPORTED_VENDOR_PRICE_SOURCE, 'i');
+const DISALLOWED_COMPARISON_PRICE_TERMS = /\$1M\+|\$100K\+|multi[- ]?million|six[- ]?figures?/i;
+const RESTRICTED_VENDORS = ['Palantir', 'Dataminr', 'Recorded Future', 'Crisis24', 'Everbridge'];
+
+function markdownTableCells(line) {
+  if (!line.startsWith('|') || !line.endsWith('|')) return [];
+  return line.slice(1, -1).split('|').map((cell) => cell.trim());
+}
+
+function assertNoUnsupportedVendorPrice(post, vendor) {
+  const namedPriceSource = RESTRICTED_VENDOR_PRICE_ALLOWLIST.get(`${post.file}:${vendor}`);
+  if (namedPriceSource) {
+    assert.ok(post.source.includes(namedPriceSource), `${post.file}: ${vendor} allowlist entry must name its price source`);
+    return;
+  }
+
+  const vendorPattern = new RegExp(`\\b${vendor}\\b`, 'i');
+  const directPricePattern = new RegExp(
+    `(?:\\b${vendor}\\b[^\\n.]{0,120}${UNSUPPORTED_VENDOR_PRICE_SOURCE}|${UNSUPPORTED_VENDOR_PRICE_SOURCE}(?:\\s+[\\w/-]+){0,3}\\s+\\b${vendor}\\b)`,
+    'i',
+  );
+  assert.doesNotMatch(
+    post.source,
+    directPricePattern,
+    `${post.file}: ${vendor} pricing needs a named source before publication`,
+  );
+
+  for (const section of post.source.split(/(?=^#{1,6}\s)/m)) {
+    const heading = section.split('\n', 1)[0];
+    if (vendorPattern.test(heading)) {
+      assert.doesNotMatch(
+        section,
+        UNSUPPORTED_VENDOR_PRICE_TERMS,
+        `${post.file}: ${vendor} pricing needs a named source before publication`,
+      );
+    }
+  }
+
+  const lines = post.source.split('\n');
+  for (let lineIndex = 0; lineIndex < lines.length - 2; lineIndex += 1) {
+    const header = markdownTableCells(lines[lineIndex]);
+    const vendorColumn = header.findIndex((cell) => vendorPattern.test(cell));
+    if (vendorColumn === -1 || !/^\\|(?:\\s*:?-{3,}:?\\s*\\|)+\\s*$/.test(lines[lineIndex + 1])) continue;
+
+    for (let rowIndex = lineIndex + 2; rowIndex < lines.length; rowIndex += 1) {
+      const row = markdownTableCells(lines[rowIndex]);
+      if (!row.length) break;
+      if (/^price$/i.test(row[0])) {
+        assert.doesNotMatch(
+          row[vendorColumn] ?? '',
+          UNSUPPORTED_VENDOR_PRICE_TERMS,
+          `${post.file}: ${vendor} table price needs a named source before publication`,
+        );
+      }
+    }
+  }
+}
 
 describe('blog SEO and GEO corpus contract', () => {
   it('keeps every post complete, unique, current, and answer-first', () => {
@@ -71,20 +133,66 @@ describe('blog SEO and GEO corpus contract', () => {
     }
   });
 
-  it('keeps capability claims aligned with generated repository facts', () => {
-    const stats = JSON.parse(readFileSync(resolve(root, 'docs/generated/stats.json'), 'utf8'));
+  it('does not reintroduce volatile aggregate inventory claims', () => {
     const corpus = posts.map((post) => post.source).join('\n');
     assert.doesNotMatch(corpus, /\b435\+ RSS|\b45\+ data layers|\b92 Global Stock|\b111 mapped|\b39 live geopolitical|\b21-language support/i);
-    assert.match(corpus, new RegExp(`\\b${stats.layerDefinitions} map layers\\b`));
-    assert.match(corpus, new RegExp(`\\b${stats.locales} languages\\b`));
-    assert.match(corpus, new RegExp(`\\b${stats.stockExchangeCount} stock exchanges\\b`));
-    assert.match(corpus, new RegExp(`\\b${stats.centralBankInstitutionCount} central banks\\b`));
-    assert.match(corpus, new RegExp(`\\b${stats.mcpToolCount} (?:live )?(?:geopolitical intelligence )?tools\\b`));
+    assert.doesNotMatch(
+      corpus,
+      /\b(?:58 map layers|28 languages|29 stock exchanges|14 central banks|63 (?:live )?(?:geopolitical intelligence )?tools)\b/i,
+    );
+  });
+
+  it('does not publish unsupported prices for enterprise-negotiated vendors', () => {
+    for (const post of posts) {
+      for (const vendor of RESTRICTED_VENDORS) {
+        assertNoUnsupportedVendorPrice(post, vendor);
+      }
+    }
+
+    for (const source of [
+      '---\ntitle: Pricing fixture\n---\n\nThis preamble is not a vendor heading.\n\n### World Monitor vs. Dataminr\n\n- Price: free vs. six-figure annual licenses',
+      '| Product | Dataminr |\n| --- | --- |\n| Price | $50K |',
+      'A $100K+ Palantir license',
+      'A Palantir license costs 100K+ annually',
+    ]) {
+      assert.throws(
+        () => assertNoUnsupportedVendorPrice({ file: 'price-claim-fixture.md', source }, source.includes('Palantir') ? 'Palantir' : 'Dataminr'),
+        /pricing needs a named source|table price needs a named source/,
+      );
+    }
+
+    const comparison = posts.find((post) => post.file === 'worldmonitor-vs-traditional-intelligence-tools.md');
+    assert.ok(comparison, 'missing the traditional intelligence comparison post');
+    assert.match(
+      comparison.source,
+      /Quartz reported in 2022[^\n]*\$24,000 per year/,
+      'the Bloomberg figure must name its published source and year',
+    );
+    assert.match(
+      comparison.source,
+      /\| Price \| \$24K\/yr \(Quartz, 2022\) \| Undisclosed \(enterprise-negotiated\) \| Undisclosed \(enterprise-negotiated\) \| Undisclosed \(enterprise-negotiated\) \| Free \|/,
+      'the price row must not turn negotiated vendor prices into estimates',
+    );
+    assert.doesNotMatch(comparison.source, DISALLOWED_COMPARISON_PRICE_TERMS);
+  });
+
+  // The explainer's own contract lives in scripts/docs-stats.mjs — its numeric
+  // counts as claims() entries, its answer-first shape as
+  // validateCategoryExplainerCopy — because the `unit` job that runs this file
+  // is gated on changes.code, whose filter drops every .md path. Asserting it
+  // here as well is what let a markdown-only edit bypass the guard entirely.
+  // This delegates instead of restating, so there is one contract, checked in
+  // the always-on docs-stats job and exercised again by the unit suite.
+  it('keeps the first-party category explainer answer-first and fact-consistent', () => {
+    const explainer = posts.find((post) => post.file === 'what-is-worldmonitor-real-time-global-intelligence.md');
+    assert.ok(explainer, 'missing first-party World Monitor category explainer');
+    assert.deepEqual(validateCategoryExplainerCopy(computeStats()), []);
   });
 
   it('keeps crawl, entity, and citation signals in the shared templates', () => {
     const base = readFileSync(resolve(root, 'blog-site/src/layouts/Base.astro'), 'utf8');
     const post = readFileSync(resolve(root, 'blog-site/src/layouts/BlogPost.astro'), 'utf8');
+    const index = readFileSync(resolve(root, 'blog-site/src/pages/index.astro'), 'utf8');
     assert.match(base, /max-image-preview:large/);
     assert.match(base, /max-snippet:-1/);
     assert.match(base, /og:image:type/);
@@ -92,6 +200,132 @@ describe('blog SEO and GEO corpus contract', () => {
     assert.match(post, /"@type": "Audience"/);
     assert.match(post, /"citation": citations/);
     assert.match(post, /\/blog\/authors\/elie-habib\//);
+    assert.match(post, /"@type": "SpeakableSpecification"/);
+    assert.match(index, /"@type": "CollectionPage"/);
+    assert.match(index, /"@type": "BreadcrumbList"/);
+    assert.match(index, /"@type": "SpeakableSpecification"/);
+  });
+
+  // blog-site is a live JSON-LD emitter separate from the crawlable corpus: the
+  // #7502 sweep in tests/crawlable-corpus.test.mjs walks built corpus output
+  // and asserts a resolvable @context on every block, and use-cases/research
+  // ride along only because buildCrawlableCorpus writes them into the same
+  // outDir. Nothing covered blog-site's eleven producers, each of which
+  // hand-wrote its own @context — a block that omitted one would have shipped
+  // silently and been ignored by every consumer (#7530). Every producer now
+  // routes through one serialiser that stamps a resolvable context; assert both
+  // the seam's behaviour and that no producer bypasses it.
+  describe('blog-site JSON-LD @context', () => {
+    const jsonLdModule = resolve(root, 'blog-site/src/lib/json-ld.ts');
+    const jsonLdSource = readFileSync(jsonLdModule, 'utf8');
+
+    // Astro templates cannot be imported here, so exercise the seam by
+    // evaluating the module's exported logic against the same cases the corpus
+    // guard uses.
+    const resolvable = (context) => {
+      const urls = new Set(['https://schema.org', 'http://schema.org']);
+      const check = (value) => {
+        if (typeof value === 'string') return urls.has(value.replace(/\/$/, ''));
+        if (Array.isArray(value)) return value.some(check);
+        if (value && typeof value === 'object') return check(value['@vocab']);
+        return false;
+      };
+      return check(context);
+    };
+
+    it('stamps a resolvable context on a node that omits one', async () => {
+      const { withSchemaContext, stringifyJsonLd } = await import(
+        pathToFileURL(jsonLdModule).href
+      );
+      assert.equal(withSchemaContext({ '@type': 'BlogPosting' })['@context'], 'https://schema.org');
+      assert.ok(resolvable(JSON.parse(stringifyJsonLd({ '@type': 'FAQPage' }))['@context']));
+    });
+
+    it('preserves a context that already resolves, including richer forms', async () => {
+      const { withSchemaContext } = await import(pathToFileURL(jsonLdModule).href);
+      const array = ['https://schema.org', { wm: 'https://www.worldmonitor.app/#' }];
+      assert.deepEqual(withSchemaContext({ '@context': array, '@type': 'Person' })['@context'], array);
+      assert.equal(
+        withSchemaContext({ '@context': 'http://schema.org', '@type': 'Person' })['@context'],
+        'http://schema.org',
+      );
+    });
+
+    it('replaces a context that does not resolve to schema.org', async () => {
+      const { withSchemaContext } = await import(pathToFileURL(jsonLdModule).href);
+      assert.equal(
+        withSchemaContext({ '@context': 'https://example.invalid/ctx', '@type': 'Thing' })['@context'],
+        'https://schema.org',
+      );
+    });
+
+    it('does not claim a replaced context retains the caller narrow type', () => {
+      assert.doesNotMatch(
+        jsonLdSource,
+        /withSchemaContext<T extends Record<string, unknown>>\(node: T\): T/,
+        'a replacement can change @context and must not be typed as the original T',
+      );
+      assert.doesNotMatch(
+        jsonLdSource,
+        /as unknown as T/,
+        'the replacement return type must not be forced back to T',
+      );
+      assert.match(
+        jsonLdSource,
+        /type WithResolvableSchemaContext<T extends Record<string, unknown>> = Omit<T, '@context'> & \{[\s\S]*'@context': unknown;/,
+        'the result type must retain other fields while widening the replaced context',
+      );
+    });
+
+    it('escapes a closing script tag so a block cannot break out', async () => {
+      const { stringifyJsonLd } = await import(pathToFileURL(jsonLdModule).href);
+      const serialised = stringifyJsonLd({ '@type': 'Thing', name: '</script><img>' });
+      assert.ok(!serialised.includes('</script>'), 'the raw closing tag must be escaped');
+      assert.equal(JSON.parse(serialised).name, '</script><img>');
+    });
+
+    it('routes every JSON-LD producer through the shared serialiser', () => {
+      // The injection sites live in Base.astro. If a template ever emits its own
+      // ld+json script tag, it bypasses the stamp entirely.
+      const emitters = [];
+      const walk = (dir) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          const path = join(dir, entry.name);
+          if (entry.isDirectory()) walk(path);
+          else if (entry.name.endsWith('.astro')) emitters.push(path);
+        }
+      };
+      walk(resolve(root, 'blog-site/src'));
+      assert.ok(emitters.length > 0, 'expected .astro templates to scan');
+
+      const base = resolve(root, 'blog-site/src/layouts/Base.astro');
+      for (const file of emitters) {
+        const source = readFileSync(file, 'utf8');
+        if (!/application\/ld\+json/.test(source)) continue;
+        assert.equal(
+          file,
+          base,
+          `${file} emits its own ld+json script tag, bypassing the shared @context stamp in Base.astro`,
+        );
+        assert.match(
+          source,
+          /set:html=\{stringifyJsonLd\(/,
+          'Base.astro must serialise every block through stringifyJsonLd',
+        );
+        assert.match(
+          source,
+          /from '\.\.\/lib\/json-ld'/,
+          'Base.astro must import the shared serialiser, not redefine one locally',
+        );
+      }
+
+      assert.doesNotMatch(
+        readFileSync(base, 'utf8'),
+        /function stringifyJsonLd/,
+        'a locally redefined serialiser would silently drop the shared @context stamp',
+      );
+      assert.match(jsonLdSource, /export function withSchemaContext/);
+    });
   });
 
   it('keeps author archives and blog JSON-LD attribution accurate', () => {
@@ -116,5 +350,23 @@ describe('blog SEO and GEO corpus contract', () => {
       blogIndex.includes('...(authorName === DEFAULT_AUTHOR ? { "@id": DEFAULT_AUTHOR_ID } : {})'),
       'blog JSON-LD must assign Elie’s stable Person ID only to the default author',
     );
+  });
+
+  it('stamps glossary and author sitemap URLs with lastmod (#7382)', async () => {
+    // post-dates.mjs, not astro.config.mjs: this workspace is installed only by
+    // the blog build now, so importing the config would need astro/config here.
+    const { buildPostDateMap } = await import('../blog-site/post-dates.mjs');
+    const dates = buildPostDateMap();
+    const iso = /^\d{4}-\d{2}-\d{2}$/;
+    for (const key of [
+      '/blog/glossary/',
+      'https://www.worldmonitor.app/blog/glossary/',
+      '/blog/glossary/strait-of-hormuz/',
+      'https://www.worldmonitor.app/blog/glossary/strait-of-hormuz/',
+      '/blog/authors/elie-habib/',
+      'https://www.worldmonitor.app/blog/authors/elie-habib/',
+    ]) {
+      assert.match(dates.get(key) ?? '', iso, `${key} must receive a YYYY-MM-DD lastmod`);
+    }
   });
 });

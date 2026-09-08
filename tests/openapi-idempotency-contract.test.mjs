@@ -6,6 +6,9 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { load as loadYaml } from 'js-yaml';
 
+import { loadUnifiedOpenApiSpec } from './_lib/openapi-spec-cache.mjs';
+import { readIdempotencyExemptPaths } from '../scripts/lib/openapi-codegen.mjs';
+
 // Guards the Idempotency-Key header parameter injected by
 // scripts/openapi-inject-idempotency.mjs onto every POST (mutation) operation.
 // The gateway (server/_shared/idempotency.ts) honors the header at runtime;
@@ -24,7 +27,10 @@ const serviceYaml = readdirSync(apiDir)
   .sort();
 
 const IDEMPOTENCY_PATTERN = '^[\\x21-\\x7E]{1,255}$';
-
+// Read the runtime's Set, not a copy: this test is the thing that would have to CATCH a
+// drift between the gateway and the two injectors, so it must not hold a third literal
+// that can drift alongside them.
+const IDEMPOTENCY_EXEMPT_PATHS = readIdempotencyExemptPaths();
 function idempotencyParam(op) {
   return (op?.parameters ?? []).find(
     (p) => p && p.in === 'header' && String(p.name).toLowerCase() === 'idempotency-key',
@@ -92,27 +98,54 @@ function assertIdempotencyResponses(op, label) {
     op.responses['422'].headers?.['Idempotency-Key'],
     `${label} 422 response must document echoed Idempotency-Key`,
   );
-  // The 2xx (success) response must document the replay markers — the only
-  // observable signal for "was this a replay?" (issue #4769 P2). The success
-  // response is 200 everywhere except async-enqueue POSTs, which document
-  // 202 Accepted instead (scripts/openapi-inject-async-jobs.mjs renames the
-  // generated 200 after the replay markers are stamped).
+  // The 2xx success response must document the replay markers — the only
+  // observable signal for "was this a replay?". Async-enqueue POSTs use 202;
+  // every other generated success uses 200.
   const successEntries = Object.entries(op.responses ?? {}).filter(([code]) => /^2\d\d$/.test(code));
   assert.equal(successEntries.length, 1, `${label} must document exactly one 2xx success response`);
   const [successCode, success] = successEntries[0];
   const echoed = success.headers?.['Idempotency-Key'];
   assert.ok(echoed, `${label} ${successCode} response must document the echoed Idempotency-Key header`);
-  assert.equal(
-    echoed.schema?.type,
-    'string',
-    `${label} ${successCode} Idempotency-Key must be a string header`,
-  );
+  assert.equal(echoed.schema?.type, 'string', `${label} ${successCode} Idempotency-Key must be a string header`);
   const replayed = success.headers?.['Idempotent-Replayed'];
   assert.ok(replayed, `${label} ${successCode} response must document the Idempotent-Replayed marker`);
   assert.equal(
     replayed.schema?.type,
     'boolean',
     `${label} ${successCode} Idempotent-Replayed must be a boolean header`,
+  );
+}
+
+function assertApplicationIdempotencyOnly(op, label) {
+  assert.equal(idempotencyParam(op), undefined, `${label} must not advertise generic response replay`);
+  assert.equal(op.responses?.['409'], undefined, `${label} must not advertise generic in-flight replay`);
+  assert.equal(op.responses?.['422'], undefined, `${label} must not advertise generic body replay conflicts`);
+  for (const [, response] of Object.entries(op.responses ?? {}).filter(([code]) => /^2\d\d$/.test(code))) {
+    assert.equal(response.headers?.['Idempotency-Key'], undefined, `${label} must not echo a generic idempotency key`);
+    assert.equal(response.headers?.['Idempotent-Replayed'], undefined, `${label} must not advertise whole-response replay`);
+  }
+  // The parameter list and the 400 prose are written by two different injectors. Check
+  // them against each other, not each against its own copy of the exempt set: an edit to
+  // the rate-limit injector alone is otherwise invisible to every check in the repo.
+  assert.doesNotMatch(
+    op.responses?.['400']?.description ?? '',
+    /Idempotency-Key/,
+    `${label} 400 must not blame a header the operation does not accept`,
+  );
+}
+
+function assertOperationIdempotency(path, op, label) {
+  if (IDEMPOTENCY_EXEMPT_PATHS.has(path)) {
+    assertApplicationIdempotencyOnly(op, label);
+    return;
+  }
+  assertIdempotencyParam(idempotencyParam(op), label);
+  assertIdempotencyResponses(op, label);
+  // Mirror assertion: a non-exempt POST advertises the header, so its 400 must say so.
+  assert.match(
+    op.responses?.['400']?.description ?? '',
+    /Idempotency-Key/,
+    `${label} 400 must document the Idempotency-Key failure mode it accepts`,
   );
 }
 
@@ -130,8 +163,7 @@ describe('OpenAPI Idempotency-Key contract', () => {
       const spec = JSON.parse(readFileSync(resolve(apiDir, file), 'utf8'));
       for (const [path, op] of postOps(spec)) {
         const label = `${file} ${path} POST`;
-        assertIdempotencyParam(idempotencyParam(op), label);
-        assertIdempotencyResponses(op, label);
+        assertOperationIdempotency(path, op, label);
       }
     });
   }
@@ -141,20 +173,18 @@ describe('OpenAPI Idempotency-Key contract', () => {
       const spec = loadYaml(readFileSync(resolve(apiDir, file), 'utf8'));
       for (const [path, op] of postOps(spec)) {
         const label = `${file} ${path} POST`;
-        assertIdempotencyParam(idempotencyParam(op), label);
-        assertIdempotencyResponses(op, label);
+        assertOperationIdempotency(path, op, label);
       }
     });
   }
 
   it('bundle (worldmonitor.openapi.yaml → /openapi.json) covers every POST', () => {
-    const bundle = loadYaml(readFileSync(resolve(apiDir, 'worldmonitor.openapi.yaml'), 'utf8'));
+    const bundle = loadUnifiedOpenApiSpec();
     const ops = postOps(bundle);
     assert.ok(ops.length > 0, 'bundle has POST operations');
     for (const [path, op] of ops) {
       const label = `bundle ${path} POST`;
-      assertIdempotencyParam(idempotencyParam(op), label);
-      assertIdempotencyResponses(op, label);
+      assertOperationIdempotency(path, op, label);
     }
   });
 

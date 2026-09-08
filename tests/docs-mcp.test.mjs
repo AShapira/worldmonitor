@@ -5,22 +5,62 @@
 // expected; use tsx (the project's standard test runner).
 import { strict as assert } from 'node:assert';
 import { afterEach, describe, it } from 'node:test';
+import { Ratelimit } from '@upstash/ratelimit';
 import handler, {
   buildJsonRpcError,
   classifyJsonRpcRequest,
   liftProtocolErrorFromToolResult,
   normalizeToolCallResponseBody,
 } from '../api/docs-mcp.ts';
+import { __resetRateLimitForTest } from '../server/_shared/rate-limit.ts';
+import { CACHE_POLICY_HEADER_NAME, CDN_CACHE_HEADERS } from './helpers/shared-cache-policy.mjs';
 
 const originalFetch = globalThis.fetch;
+const originalEnv = { ...process.env };
+const originalSlidingWindow = Ratelimit.slidingWindow;
+
+function clearUpstashEnv() {
+  // This suite assumes Redis is absent so checkScopedRateLimit fails open
+  // without an Upstash fetch. Cloud agent / local envs may inject UPSTASH_*.
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
+}
+
 afterEach(() => {
+  __resetRateLimitForTest();
+  Ratelimit.slidingWindow = originalSlidingWindow;
   globalThis.fetch = originalFetch;
+  for (const key of Object.keys(process.env)) {
+    if (!(key in originalEnv)) delete process.env[key];
+  }
+  Object.assign(process.env, originalEnv);
 });
+
+function forceRateLimitDenial() {
+  process.env.UPSTASH_REDIS_REST_URL = 'https://stub.upstash.invalid';
+  process.env.UPSTASH_REDIS_REST_TOKEN = 'stub-token';
+  __resetRateLimitForTest();
+  const calls = [];
+  Ratelimit.slidingWindow = (tokens, window) => () => ({
+    async limit(_ctx, key) {
+      calls.push({ key, tokens, window });
+      return {
+        success: false,
+        limit: tokens,
+        remaining: 0,
+        reset: Date.now() + 60_000,
+        pending: Promise.resolve(),
+      };
+    },
+  });
+  return calls;
+}
 
 // No Upstash env is set in this suite, so checkScopedRateLimit degrades
 // availability-first (fail-open) and the handler proceeds to the upstream —
 // which every test below mocks.
 function mockUpstream(body, { contentType = 'text/event-stream', status = 200 } = {}) {
+  clearUpstashEnv();
   const calls = [];
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url: String(url), init });
@@ -32,7 +72,12 @@ function mockUpstream(body, { contentType = 'text/event-stream', status = 200 } 
 function post(body, headers = {}) {
   return new Request('https://www.worldmonitor.app/api/docs-mcp', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', ...headers },
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      'x-real-ip': '203.0.113.42',
+      ...headers,
+    },
     body,
   });
 }
@@ -173,7 +218,93 @@ describe('docs-mcp normalizeToolCallResponseBody', () => {
 });
 
 describe('docs-mcp handler', () => {
+  it('echoes string and numeric request ids, including 0, on a forced -32029 denial', async () => {
+    const limiterCalls = forceRateLimitDenial();
+    for (const id of ['docs-rate-1', 7, 0]) {
+      const res = await handler(post(JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' })));
+      assert.equal(res.status, 429);
+      const payload = await res.json();
+      assert.equal(payload.id, id);
+      assert.equal(payload.error.code, -32029);
+    }
+    const unsafe = await handler(post(JSON.stringify({
+      jsonrpc: '2.0',
+      id: '🚀'.repeat(65),
+      method: 'tools/list',
+    })));
+    assert.equal((await unsafe.json()).id, null, 'a string id over 256 UTF-8 bytes must not be echoed');
+    const nonFinite = await handler(post('{"jsonrpc":"2.0","id":1e400,"method":"tools/list"}'));
+    assert.equal((await nonFinite.json()).id, null, 'a non-finite numeric id must not be echoed');
+    assert.deepEqual(
+      limiterCalls,
+      Array.from({ length: 5 }, () => ({
+        key: 'rl:scope:/api/docs-mcp:203.0.113.42',
+        tokens: 60,
+        window: '60 s',
+      })),
+      'the production limiter key and 60/min/IP policy must stay unchanged',
+    );
+  });
+
+  it('rejects a UTF-8 request body whose encoded size exceeds 256 KiB', async () => {
+    const limiterCalls = forceRateLimitDenial();
+    const upstreamCalls = [];
+    globalThis.fetch = async (url) => {
+      upstreamCalls.push(String(url));
+      return new Response('{}');
+    };
+    // Each e-acute is one JavaScript UTF-16 code unit but two UTF-8 bytes.
+    // Including the JSON quotes, this stays well below the cap by .length
+    // while exceeding it on the wire.
+    const prefix = '{"jsonrpc":"2.0","id":"oversized-docs","method":"tools/call","params":{"text":"';
+    const body = `${prefix}${'é'.repeat(131_072)}"}}`;
+    assert.ok(body.length < 262_144);
+    assert.ok(new TextEncoder().encode(body).byteLength > 262_144);
+
+    const res = await handler(post(body));
+
+    assert.equal(res.status, 413);
+    assert.equal(
+      upstreamCalls.filter((url) => url.includes('mintlify')).length,
+      0,
+      'oversized bodies must not reach the upstream',
+    );
+    const payload = await res.json();
+    assert.equal(payload.id, null, 'an oversized body must not echo an id');
+    assert.equal(payload.error.code, -32600);
+    assert.equal(limiterCalls.length, 0, 'the byte cap must reject before the scoped limiter runs');
+  });
+
+  it('counts a leading UTF-8 BOM against the raw 256 KiB request limit', async () => {
+    clearUpstashEnv();
+    const upstreamCalls = [];
+    globalThis.fetch = async (url) => {
+      upstreamCalls.push(String(url));
+      return new Response('{}');
+    };
+    const rpc = '{"jsonrpc":"2.0","id":1,"method":"ping"}';
+    const decodedBody = `${rpc}${' '.repeat(262_144 - rpc.length)}`;
+    const encodedBody = new TextEncoder().encode(decodedBody);
+    assert.equal(encodedBody.byteLength, 262_144);
+
+    const wireBody = new Uint8Array(encodedBody.byteLength + 3);
+    wireBody.set([0xef, 0xbb, 0xbf]);
+    wireBody.set(encodedBody, 3);
+
+    const res = await handler(post(wireBody));
+
+    assert.equal(res.status, 413);
+    assert.equal(
+      upstreamCalls.filter((url) => url.includes('mintlify')).length,
+      0,
+      'BOM-prefixed oversized bodies must not reach the upstream',
+    );
+    const payload = await res.json();
+    assert.equal(payload.error.code, -32600);
+  });
+
   it('answers malformed JSON locally with a structured -32700 error and CORS headers', async () => {
+    clearUpstashEnv();
     let upstreamCalled = false;
     globalThis.fetch = async () => {
       upstreamCalled = true;
@@ -190,6 +321,7 @@ describe('docs-mcp handler', () => {
   });
 
   it('answers non-JSON-RPC envelopes locally with -32600', async () => {
+    clearUpstashEnv();
     const res = await handler(post('{"hello":"world","id":5}'));
     assert.equal(res.status, 400);
     const body = await res.json();
@@ -231,6 +363,34 @@ describe('docs-mcp handler', () => {
     assert.equal(await res.text(), sse);
   });
 
+  it('forces no-store on proxied responses, including the cacheable 405 Mintlify returns for a bare GET', async () => {
+    clearUpstashEnv();
+    // Every header that can carry a shared-cache policy, from the shared list:
+    // a CDN-specific one left in place outranks the handler's no-store.
+    const upstreamHeaders = {
+      'content-type': 'application/json',
+      'cache-control': 'public, max-age=0, must-revalidate',
+      ...Object.fromEntries(CDN_CACHE_HEADERS.map((name) => [name.toLowerCase(), 'public, s-maxage=600, stale-while-revalidate=60'])),
+    };
+    globalThis.fetch = async () =>
+      new Response('{"jsonrpc":"2.0","error":{"code":-32000,"message":"Method not allowed."},"id":null}', {
+        status: 405,
+        headers: upstreamHeaders,
+      });
+    const res = await handler(
+      new Request('https://www.worldmonitor.app/api/docs-mcp', { method: 'GET', headers: { accept: 'application/json' } }),
+    );
+    assert.equal(res.status, 405, 'the upstream status is preserved');
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    for (const name of CDN_CACHE_HEADERS) {
+      assert.equal(res.headers.get(name), null, `${name} must be stripped from the proxied response`);
+    }
+    for (const [name, value] of res.headers) {
+      assert.ok(!CACHE_POLICY_HEADER_NAME.test(name) || value === 'no-store', `${name}: ${value} is a shared-cache policy`);
+    }
+    assert.equal(res.headers.get('content-type'), 'application/json');
+  });
+
   it('answers OPTIONS preflight locally with permissive CORS', async () => {
     const res = await handler(
       new Request('https://www.worldmonitor.app/api/docs-mcp', { method: 'OPTIONS' }),
@@ -241,6 +401,7 @@ describe('docs-mcp handler', () => {
   });
 
   it('maps upstream fetch failures to a structured -32603 error', async () => {
+    clearUpstashEnv();
     globalThis.fetch = async () => {
       throw new Error('connect ETIMEDOUT');
     };

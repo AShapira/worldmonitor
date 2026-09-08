@@ -1,7 +1,8 @@
 // U1 (#3199) — apiDailyAllowance catalog field + Business marketing copy.
 // The per-account rate-limit layer reads features.apiDailyAllowance; these
-// values are the single source of truth for the included allowance and the
-// 10× safety ceiling, and feed the /pro marketing + docs/usage-rate-limits.mdx.
+// values are the single source of truth for the included allowance (enforced
+// at the sold cap since #4635), and feed the /pro marketing +
+// docs/usage-rate-limits.mdx.
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -60,5 +61,31 @@ describe('#3199 U1 — Business marketing differentiation', () => {
       starter.some((f) => /1,000 requests\/day included/i.test(f)),
       'Starter daily copy must say "included"',
     );
+  });
+});
+
+describe('dashboard-AI allowance is separate from MCP', () => {
+  it('sets the agreed daily dashboard-AI limits by plan family', () => {
+    assert.equal(getEntitlementFeatures('free').planLimits?.dashboardAiCallsPerDay, 0);
+    assert.equal(getEntitlementFeatures('pro_monthly').planLimits?.dashboardAiCallsPerDay, 500);
+    assert.equal(getEntitlementFeatures('pro_business_monthly').planLimits?.dashboardAiCallsPerDay, 2500);
+    assert.equal(getEntitlementFeatures('api_starter').planLimits?.dashboardAiCallsPerDay, 1000);
+    assert.equal(getEntitlementFeatures('api_business').planLimits?.dashboardAiCallsPerDay, 10000);
+    assert.equal(getEntitlementFeatures('enterprise').planLimits?.dashboardAiCallsPerDay, null);
+  });
+
+  it('does not change the existing MCP allowances', () => {
+    assert.equal(getEntitlementFeatures('pro_monthly').planLimits?.mcpCallsPerDay, 50);
+    assert.equal(getEntitlementFeatures('pro_business_monthly').planLimits?.mcpCallsPerDay, 250);
+  });
+
+  it('sets the dashboard-AI field explicitly for every catalog entry', () => {
+    for (const [planKey, entry] of Object.entries(PRODUCT_CATALOG)) {
+      const limit = entry.features.planLimits?.dashboardAiCallsPerDay;
+      assert.ok(
+        typeof limit === 'number' || limit === null,
+        `${planKey} must set dashboardAiCallsPerDay explicitly`,
+      );
+    }
   });
 });

@@ -1,5 +1,6 @@
 import { motion } from 'motion/react';
 import { Check } from 'lucide-react';
+import { CardLinkArrow, cardLinkFocusRing } from './CardLink';
 import { t } from '../i18n';
 
 // Registry install commands are product identifiers, not prose — they stay
@@ -9,6 +10,13 @@ const INSTALL_CHIPS = [
   { cmd: 'pip install worldmonitor-sdk', href: 'https://pypi.org/project/worldmonitor-sdk/' },
   { cmd: 'gem install worldmonitor', href: 'https://rubygems.org/gems/worldmonitor' },
   { cmd: 'go get github.com/koala73/worldmonitor/sdk/go', href: 'https://pkg.go.dev/github.com/koala73/worldmonitor/sdk/go' },
+] as const;
+
+const AGENT_RESOURCES = [
+  { key: 'briefing', href: '/llms.txt', display: '/llms.txt', eventTarget: 'welcome-agent-briefing' },
+  { key: 'mcp', href: 'https://worldmonitor.app/mcp', display: 'worldmonitor.app/mcp', eventTarget: 'welcome-agent-mcp' },
+  { key: 'api', href: 'https://api.worldmonitor.app', display: 'api.worldmonitor.app', eventTarget: 'welcome-agent-api' },
+  { key: 'agentView', href: '/?mode=agent', display: '/?mode=agent', eventTarget: 'welcome-agent-view' },
 ] as const;
 
 export const Agents = () => (
@@ -31,6 +39,28 @@ export const Agents = () => (
             </li>
           ))}
         </ul>
+        <div className="mb-6">
+          <p className="mb-3 font-mono text-[10px] uppercase tracking-[2px] text-wm-text">
+            {t('welcome.agents.resources.title')}
+          </p>
+          <div className="grid gap-px overflow-hidden rounded-sm border border-wm-border bg-wm-border sm:grid-cols-2">
+            {AGENT_RESOURCES.map(({ key, href, display, eventTarget }) => (
+              <a
+                key={key}
+                href={href}
+                data-umami-event="welcome-cta"
+                data-umami-event-target={eventTarget}
+                className={`group flex min-w-0 items-center justify-between gap-3 bg-wm-card px-4 py-3 text-sm transition-colors hover:bg-wm-bg/80 ${cardLinkFocusRing}`}
+              >
+                <span className="min-w-0">
+                  <span className="block font-medium text-wm-text">{t(`welcome.agents.resources.${key}`)}</span>
+                  <span className="block truncate font-mono text-[10px] text-wm-muted">{display}</span>
+                </span>
+                <CardLinkArrow className="shrink-0 text-wm-green" />
+              </a>
+            ))}
+          </div>
+        </div>
         <div className="mb-6 rounded-sm border border-wm-border bg-wm-card/70 font-mono text-[11px] leading-none">
           {INSTALL_CHIPS.map(({ cmd, href }, i) => (
             <a
@@ -47,7 +77,7 @@ export const Agents = () => (
         </div>
         <p className="font-mono text-xs uppercase tracking-wider text-wm-text mb-8">{t('welcome.agents.promise')}</p>
         <a
-          href="https://www.worldmonitor.app/docs"
+          href="https://www.worldmonitor.app/docs/documentation"
           className="border border-wm-border text-wm-text px-6 py-3 rounded-sm font-mono text-sm uppercase tracking-wider font-bold hover:border-wm-green/50 transition-colors inline-block"
         >
           {t('welcome.agents.cta')}
@@ -80,7 +110,7 @@ export const Agents = () => (
           </p>
           <p className="text-wm-text mb-2"><span className="text-wm-green" aria-hidden="true">✓</span> {t('welcome.agents.termAnswer')}</p>
           <p>
-            <a href="https://www.worldmonitor.app/docs" className="text-wm-green hover:text-green-300 transition-colors">{t('welcome.agents.termDocs')}</a>
+            <a href="https://www.worldmonitor.app/docs/documentation" className="text-wm-green hover:text-green-300 transition-colors">{t('welcome.agents.termDocs')}</a>
           </p>
         </div>
       </motion.div>

@@ -1,4 +1,5 @@
 import { loadFromStorage, saveToStorage } from '@/utils';
+import { safeStorageGet } from '@/utils/safe-storage';
 import { clearPanelColSpanEntry, clearPanelSpanEntry } from '@/utils/panel-storage';
 import { getAuthState } from '@/services/auth-state';
 import { isEntitled, getEntitlementState } from '@/services/entitlements';
@@ -65,7 +66,7 @@ function materializeWidgets(raw: unknown, strict: boolean): CustomWidgetSpec[] {
     // the dashboard.
     const tier = w.tier === 'pro' ? 'pro' : 'basic';
     if (tier === 'pro') {
-      const sideKeyHtml = localStorage.getItem(proHtmlKey(w.id));
+      const sideKeyHtml = safeStorageGet(proHtmlKey(w.id));
       const storedHtml = typeof w.html === 'string' ? w.html : '';
       const proHtml = storedHtml || sideKeyHtml;
       if (!proHtml) {
@@ -153,6 +154,17 @@ export function getWidget(id: string): CustomWidgetSpec | null {
 let widgetSessionHint = false;
 let proSessionHint = false;
 let migrationStarted = false;
+const accessListeners = new Set<() => void>();
+
+function notifyAccessChanged(): void {
+  for (const listener of accessListeners) listener();
+}
+
+/** Observe tab-local tester-key changes without exposing credential values. */
+export function subscribeWidgetAccess(listener: () => void): () => void {
+  accessListeners.add(listener);
+  return () => accessListeners.delete(listener);
+}
 
 function migrateLegacyKeyStorage(): void {
   if (migrationStarted || typeof window === 'undefined') return;
@@ -169,6 +181,7 @@ function migrateLegacyKeyStorage(): void {
 export function setWidgetKey(key: string): void {
   const trimmed = key.trim();
   widgetSessionHint = !!trimmed;
+  notifyAccessChanged();
   if (!trimmed) {
     clearLegacyKeyStorage('wm-widget-key');
     return;
@@ -180,6 +193,7 @@ export function setWidgetKey(key: string): void {
 export function setProKey(key: string): void {
   const trimmed = key.trim();
   proSessionHint = !!trimmed;
+  notifyAccessChanged();
   if (!trimmed) {
     clearLegacyKeyStorage('wm-pro-key');
     return;

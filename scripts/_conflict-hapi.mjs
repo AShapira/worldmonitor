@@ -1,12 +1,19 @@
 import Papa from 'papaparse';
 
 import {
-  CHROME_UA,
   loadSharedConfig,
 } from './_seed-utils.mjs';
 
 export const HAPI_PAGE_LIMIT = 10_000;
-export const HAPI_MAX_PAGES = 3;
+// 3 pages sized the admin-0-only sweep, which is ~650 rows — two orders of
+// magnitude of slack. The global admin-2 sweep that covers the HRP countries is
+// ~13.8k rows for ONE monthly reference period (measured 2026-09-04), and the
+// seeder's previousMonthStart window can hold TWO of them, i.e. ~27.6k — 92% of
+// a 30k ceiling, with an overflow throwing instead of truncating. 5 pages keeps
+// ~1.8x headroom on that measured worst case while capping a stalled sweep at
+// 5 x HAPI_REQUEST_TIMEOUT_MS(15s) = 75s, which the seeder's fetch-deadline
+// arithmetic above GDELT_SWEEP_BUDGET_MS accounts for.
+export const HAPI_MAX_PAGES = 5;
 export const HAPI_HDX_PACKAGE_URL = 'https://data.humdata.org/api/3/action/package_show?id=hdx-hapi-conflict-event';
 const HAPI_HDX_METADATA_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 export const HAPI_HDX_MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -17,6 +24,8 @@ export const HAPI_HDX_METADATA_TIMEOUT_MS = 60_000;
 export const HAPI_HDX_SNAPSHOT_TIMEOUT_MS = 120_000;
 
 const ISO2_TO_ISO3 = loadSharedConfig('iso2-to-iso3.json');
+const HAPI_APP_IDENTIFIER_CONFIG = loadSharedConfig('hapi-app-identifier.json');
+const HAPI_HDX_USER_AGENT = `${HAPI_APP_IDENTIFIER_CONFIG.application}/1.0`;
 const ISO3_TO_ISO2 = new Map(
   Object.entries(ISO2_TO_ISO3).map(([iso2, iso3]) => [String(iso3).toUpperCase(), iso2]),
 );
@@ -227,7 +236,7 @@ export async function fetchHapiHdxSnapshotRows({
   const requestOptions = (accept, timeoutMs) => ({
     headers: {
       Accept: accept,
-      'User-Agent': CHROME_UA,
+      'User-Agent': HAPI_HDX_USER_AGENT,
     },
     signal: createTimeoutSignal(timeoutMs),
   });

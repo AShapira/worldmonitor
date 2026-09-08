@@ -20,7 +20,13 @@ import {
   CHECKOUT_PRODUCT_PARAM,
   CHECKOUT_REF_PARAM,
   CHECKOUT_DISCOUNT_PARAM,
+  CHECKOUT_ATTRIBUTION_PARAM,
 } from '../pro-test/src/services/checkout-intent-url.ts';
+import {
+  CHECKOUT_HANDOFF_PARAM,
+  CHECKOUT_MISSION_PARAM,
+  CHECKOUT_PANEL_PARAM,
+} from '../shared/checkout-attribution.ts';
 
 describe('parseCheckoutIntentFromSearch', () => {
   it('returns null when no productId param is present (normal page load)', () => {
@@ -31,21 +37,67 @@ describe('parseCheckoutIntentFromSearch', () => {
 
   it('returns intent with just productId when only the required param is present', () => {
     const intent = parseCheckoutIntentFromSearch(`?${CHECKOUT_PRODUCT_PARAM}=pro_monthly`);
-    assert.deepEqual(intent, { productId: 'pro_monthly', referralCode: undefined, discountCode: undefined });
+    assert.deepEqual(intent, {
+      productId: 'pro_monthly',
+      referralCode: undefined,
+      discountCode: undefined,
+      attributionSource: undefined,
+    });
   });
 
   it('returns full intent with optional referralCode + discountCode', () => {
     const intent = parseCheckoutIntentFromSearch(
       `?${CHECKOUT_PRODUCT_PARAM}=pro_annual&${CHECKOUT_REF_PARAM}=abc123&${CHECKOUT_DISCOUNT_PARAM}=SAVE20`,
     );
-    assert.deepEqual(intent, { productId: 'pro_annual', referralCode: 'abc123', discountCode: 'SAVE20' });
+    assert.deepEqual(intent, {
+      productId: 'pro_annual',
+      referralCode: 'abc123',
+      discountCode: 'SAVE20',
+      attributionSource: undefined,
+    });
+  });
+
+  it('returns attributionSource when the MCP paid-funnel param is present (#6716)', () => {
+    const intent = parseCheckoutIntentFromSearch(
+      `?${CHECKOUT_PRODUCT_PARAM}=pro_monthly&${CHECKOUT_ATTRIBUTION_PARAM}=mcp-paid-funnel`,
+    );
+    assert.deepEqual(intent, {
+      productId: 'pro_monthly',
+      referralCode: undefined,
+      discountCode: undefined,
+      attributionSource: 'mcp-paid-funnel',
+    });
+  });
+
+  it('parses only registered mission preview attribution and a desktop handoff', () => {
+    const intent = parseCheckoutIntentFromSearch(
+      `?${CHECKOUT_PRODUCT_PARAM}=pro_monthly&${CHECKOUT_MISSION_PARAM}=energy-security`
+      + `&${CHECKOUT_PANEL_PARAM}=pipeline-status&${CHECKOUT_HANDOFF_PARAM}=desktop`,
+    );
+    assert.deepEqual(intent?.checkoutAttribution, {
+      kind: 'mission-preview',
+      missionId: 'energy-security',
+      panelKey: 'pipeline-status',
+    });
+    assert.equal(intent?.desktopHandoff, true);
+
+    const mismatched = parseCheckoutIntentFromSearch(
+      `?${CHECKOUT_PRODUCT_PARAM}=pro_monthly&${CHECKOUT_MISSION_PARAM}=energy-security`
+      + `&${CHECKOUT_PANEL_PARAM}=cii`,
+    );
+    assert.equal(mismatched?.checkoutAttribution, undefined);
   });
 
   it('ignores unrelated query params', () => {
     const intent = parseCheckoutIntentFromSearch(
       `?utm_source=email&${CHECKOUT_PRODUCT_PARAM}=pro_monthly&utm_campaign=launch`,
     );
-    assert.deepEqual(intent, { productId: 'pro_monthly', referralCode: undefined, discountCode: undefined });
+    assert.deepEqual(intent, {
+      productId: 'pro_monthly',
+      referralCode: undefined,
+      discountCode: undefined,
+      attributionSource: undefined,
+    });
   });
 
   it('rejects empty productId (defensive)', () => {
@@ -87,6 +139,14 @@ describe('stripCheckoutIntentFromSearch', () => {
   it('strips all three checkout params together (partial cleanup would leave ghosts)', () => {
     const result = stripCheckoutIntentFromSearch(
       `?${CHECKOUT_PRODUCT_PARAM}=X&${CHECKOUT_REF_PARAM}=Y&${CHECKOUT_DISCOUNT_PARAM}=Z&keep=me`,
+    );
+    assert.equal(result, '?keep=me');
+  });
+
+  it('strips mission preview and desktop handoff intent', () => {
+    const result = stripCheckoutIntentFromSearch(
+      `?${CHECKOUT_PRODUCT_PARAM}=X&${CHECKOUT_MISSION_PARAM}=crisis-desk`
+      + `&${CHECKOUT_PANEL_PARAM}=cii&${CHECKOUT_HANDOFF_PARAM}=desktop&keep=me`,
     );
     assert.equal(result, '?keep=me');
   });
@@ -150,6 +210,20 @@ describe('buildCheckoutReturnUrl', () => {
     assert.equal(url.pathname, '/pro');
     assert.equal(url.hash, '#pricing');
   });
+
+  it('carries preview attribution and desktop handoff through sign-in', () => {
+    const returnUrl = buildCheckoutReturnUrl('https://worldmonitor.app/pro', 'pro_monthly', {
+      checkoutAttribution: {
+        missionId: 'crisis-desk',
+        panelKey: 'cii',
+      },
+      desktopHandoff: true,
+    });
+    const url = new URL(returnUrl);
+    assert.equal(url.searchParams.get(CHECKOUT_MISSION_PARAM), 'crisis-desk');
+    assert.equal(url.searchParams.get(CHECKOUT_PANEL_PARAM), 'cii');
+    assert.equal(url.searchParams.get(CHECKOUT_HANDOFF_PARAM), 'desktop');
+  });
 });
 
 describe('reviewer scenario coverage (regression guards)', () => {
@@ -163,7 +237,12 @@ describe('reviewer scenario coverage (regression guards)', () => {
     const search = new URL(returnUrl).search;
     const intent = parseCheckoutIntentFromSearch(search);
     // 4. Intent parsed; doCheckout fires with correct params
-    assert.deepEqual(intent, { productId: 'pro_monthly', referralCode: 'abc', discountCode: undefined });
+    assert.deepEqual(intent, {
+      productId: 'pro_monthly',
+      referralCode: 'abc',
+      discountCode: undefined,
+      attributionSource: undefined,
+    });
   });
 
   it('scenario 2: click paid → dismiss sign-in → later generic sign-in does NOT resume', () => {
