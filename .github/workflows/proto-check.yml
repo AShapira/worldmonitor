@@ -155,12 +155,17 @@ jobs:
             exit 1
           fi
 
-          if [ "$EXPECTED_FILE_COUNT" -gt 3000 ] || [ "$RETURNED_FILE_COUNT" -ne "$EXPECTED_FILE_COUNT" ]; then
+          ALL_PROTO_CHECKS=false
+          if [ "$EXPECTED_FILE_COUNT" -gt 3000 ] && [ "$RETURNED_FILE_COUNT" -eq 3000 ]; then
+            echo "GitHub's file-list limit was reached; running all proto checks conservatively."
+            ALL_PROTO_CHECKS=true
+          elif [ "$RETURNED_FILE_COUNT" -ne "$EXPECTED_FILE_COUNT" ]; then
             echo "ERROR: GitHub returned $RETURNED_FILE_COUNT of $EXPECTED_FILE_COUNT changed files; refusing an incomplete codegen classification."
             exit 1
           fi
 
           jq -r \
+            --argjson all_proto_checks "$ALL_PROTO_CHECKS" \
             --arg action "$EVENT_ACTION" \
             --arg actor "$EVENT_ACTOR" \
             --arg head_repository "$EVENT_HEAD_REPOSITORY" \
@@ -184,8 +189,8 @@ jobs:
             [.[][]? | .filename, (.previous_filename // empty)] as $paths
             |
             {
-              codegen: any($paths[]; . as $path | matches_registry($path; $consumed) or matches_registry($path; $generated)),
-              breaking: any($paths[]; test("^proto(?:/|$)"))
+              codegen: ($all_proto_checks or any($paths[]; . as $path | matches_registry($path; $consumed) or matches_registry($path; $generated))),
+              breaking: ($all_proto_checks or any($paths[]; test("^proto(?:/|$)")))
             } as $classification
             |
             $classification + {

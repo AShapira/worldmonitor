@@ -572,7 +572,7 @@ describe('proto codegen workflow trust boundaries (#3340)', () => {
     assert.equal(result.output, '');
   });
 
-  it('fails closed when PR metadata moves or GitHub truncates the file list', () => {
+  it('fails closed when PR metadata moves or the file list is unexpectedly incomplete', () => {
     const moved = runChangeClassifier(['src/components/Panel.ts'], { headSha: 'moved' });
     assert.notEqual(moved.status, 0);
     assert.equal(moved.output, '');
@@ -582,6 +582,18 @@ describe('proto codegen workflow trust boundaries (#3340)', () => {
     assert.notEqual(truncated.status, 0);
     assert.equal(truncated.output, '');
     assert.match(truncated.stdout, /returned 1 of 3001 changed files/i);
+  });
+
+  it('runs all proto checks at the GitHub file-list cap without granting fork trust', () => {
+    const files = Array.from({ length: 3000 }, (_, i) => `docs/fixture-${i}.md`);
+    const result = runChangeClassifier(files, { changedFiles: 3967 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.output, /^codegen=true$/m);
+    assert.match(result.output, /^breaking=true$/m);
+    assert.match(result.output, /^trusted_fork=false$/m);
+    const moved = runChangeClassifier(files, { changedFiles: 3967, baseSha: 'moved' });
+    assert.notEqual(moved.status, 0);
+    assert.equal(moved.output, '');
   });
 
   it('classifies every paginated PR-files page', () => {
