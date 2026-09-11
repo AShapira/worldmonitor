@@ -71,6 +71,9 @@ function makeStubs(auxDir) {
 function hookEnv(bin) {
   const env = {
     ...process.env,
+    // Fixture assertions exercise the default; per-case extraEnv can override it.
+    WM_PREPUSH_TEST_CONCURRENCY: '2',
+    WM_BASE_REF: '',
     PATH: `${bin}:${process.env.PATH}`,
     // The fixture's .husky is not the outer worktree's, which is exactly what
     // the self-identity tripwire is for. It is not what this file tests.
