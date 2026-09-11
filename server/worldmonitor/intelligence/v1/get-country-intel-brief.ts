@@ -177,7 +177,7 @@ export async function getCountryIntelBrief(
     frameworkHash: frameworkRaw ? frameworkHashFull.slice(0, 8) : '',
     energyYear,
     energyImportYear,
-  }) + localLlmCacheTag();
+  }) + localLlmCacheTag() + (isLocalLlmProfile() ? ':evidence-v2' : '');
   const countryCode = req.countryCode.toUpperCase();
   const countryName = TIER1_COUNTRIES[countryCode]
     || displayNameForIso2(countryCode)
@@ -232,6 +232,11 @@ Rules:
         entrySources = shared.sources;
       }
 
+      // Sparse local coverage must not turn an empty feed into claims of calm.
+      // Fail closed before inference; historical energy data alone cannot ground
+      // the current situation and 24/48/72-hour outlook requested by this brief.
+      if (isLocalLlmProfile() && entrySources.length === 0) return null;
+
       const userPromptParts = [`Country: ${countryName} (${req.countryCode})`];
 
       if (energyMixData) {
@@ -252,7 +257,7 @@ Rules:
 
       const llmResult = await (isLocalLlmProfile() ? callLlmReasoning : callLlm)({
         messages: [
-          { role: 'system', content: systemPrompt },
+          { role: 'system', content: systemPrompt + (isLocalLlmProfile() ? '\nMissing feeds or zero observed events are coverage gaps, not evidence that no disruptions exist. Preserve source dates and distinguish historical measurements from current conditions. Cite the supplied sources for current claims.' : '') },
           { role: 'user', content: userPromptParts.join('\n\n') },
         ],
         temperature: 0.4,
@@ -262,7 +267,9 @@ Rules:
         stage: 'country-intel-brief',
         ...localLlmOptions(true),
         ...(isLocalLlmProfile() ? {
-          validate: (content: string) => verifyCitationIndexes(content, entrySources.length).stripped === 0,
+          validate: (content: string) => verifyCitationIndexes(content, entrySources.length).stripped === 0
+            && /\[\d+\]/.test(content)
+            && checkLeadGrounding({ lead: content.slice(0, 600) }, entrySources.map(source => ({ headline: source.title })), entrySources.length),
         } : {}),
       });
 

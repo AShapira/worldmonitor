@@ -28,10 +28,15 @@ afterEach(() => {
   }
 });
 
-function installOllama(contents: string[]) {
+function installOllama(contents: string[], withCountrySources = false) {
   const requests: Array<Record<string, any>> = [];
   globalThis.fetch = (async (input, init) => {
     const url = String(input);
+    if (withCountrySources && url.startsWith('https://redis.fixture/')) {
+      if (new URL(url).pathname === '/pipeline') return Response.json([{ result: [] }]);
+      const key = decodeURIComponent(new URL(url).pathname.slice('/get/'.length));
+      return Response.json({ result: key === 'news:digest:v1:full:en' ? JSON.stringify({ items: [{ title: 'Israel reports port disruption', source: 'Fixture Wire', link: 'https://example.com/port', publishedAt: '2026-09-11T00:00:00Z' }] }) : null });
+    }
     if (url === 'http://localhost:11434' || url === 'http://localhost:11434/') return new Response('Ollama is running');
     assert.equal(url, 'http://localhost:11434/v1/chat/completions', 'local report must not contact cloud inference');
     const body = JSON.parse(String(init?.body));
@@ -43,15 +48,25 @@ function installOllama(contents: string[]) {
 
 describe('balanced local report handlers', () => {
   it('rejects fabricated country citations and retries with a direct final answer', async () => {
-    const requests = installOllama(['Unsupported claim [99].', 'SITUATION NOW\nAvailable evidence is insufficient for a country-specific conclusion.']);
+    process.env.UPSTASH_REDIS_REST_URL = 'https://redis.fixture';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'fixture-token';
+    const requests = installOllama(['Unsupported claim [99].', 'SITUATION NOW\nIsrael reports port disruption [1]. Further evidence is needed to assess its duration.'], true);
     const result = await getCountryIntelBrief(context('/api/intelligence/v1/get-country-intel-brief?country_code=IL'), { countryCode: 'IL', framework: '' });
     assert.equal(result.model, 'qwen3.5:9b');
-    assert.match(result.brief, /Available evidence is insufficient/);
+    assert.match(result.brief, /Israel reports port disruption \[1\]/);
     assert.doesNotMatch(result.brief, /99/);
     assert.equal(requests.length, 2);
     assert.equal(requests[0].think, true);
     assert.equal(requests[0].max_tokens, 6144);
     assert.equal(requests[1].think, false);
+  });
+
+  it('does not infer a current country situation from missing sources or zero event counts', async () => {
+    const requests = installOllama(['No disruptions exist.']);
+    const result = await getCountryIntelBrief(context('/api/intelligence/v1/get-country-intel-brief?country_code=IL'), { countryCode: 'IL', framework: '' });
+    assert.equal(result.brief, '');
+    assert.equal(result.model, '');
+    assert.equal(requests.length, 0);
   });
 
   it('generates situation analysis with the local reasoning profile', async () => {

@@ -29,6 +29,10 @@ Hosted configurations without this profile retain their provider behavior.
   analysis and market implications use the local model. Financial calculations,
   evidence checks and hosted probability-stage policies remain intact.
 
+Local country briefs require linked source evidence and a source-anchored lead.
+Missing source coverage returns an unavailable brief instead of inferred calm;
+a separate cache version prevents reuse of earlier ungrounded answers.
+
 Generated prose caches include the local profile and model identity. Historical
 reports keep their original provenance. Do not flush Redis to change models.
 
