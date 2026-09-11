@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { isTitlePlausible, isAllowedHost, normalizePathFilters, matchesAnyPathFilter } from './search.js';
+import {
+  isTitlePlausible,
+  isAllowedHost,
+  normalizeAllowedHosts,
+  normalizePathFilters,
+  matchesAnyPathFilter,
+  matchesRequiredPathSegments,
+  looksLikeQuantityAsPrice,
+} from './search.js';
 
 describe('isAllowedHost', () => {
   it('accepts exact domain match', () => {
@@ -24,6 +32,20 @@ describe('isAllowedHost', () => {
   it('handles malformed URLs gracefully', () => {
     expect(isAllowedHost('not-a-url', 'noon.com')).toBe(false);
     expect(isAllowedHost('', 'noon.com')).toBe(false);
+  });
+
+  it('accepts only explicitly configured host aliases', () => {
+    expect(isAllowedHost('https://minutes.noon.com/uae-en/now-product/ABC', ['www.noon.com', 'minutes.noon.com'])).toBe(true);
+    expect(isAllowedHost('https://evil-noon.com/uae-en/now-product/ABC', ['www.noon.com', 'minutes.noon.com'])).toBe(false);
+  });
+});
+
+describe('normalizeAllowedHosts', () => {
+  it('keeps the base host, removes duplicates, and normalizes aliases', () => {
+    expect(normalizeAllowedHosts('www.noon.com', [' minutes.noon.com ', 'www.noon.com'])).toEqual([
+      'www.noon.com',
+      'minutes.noon.com',
+    ]);
   });
 });
 
@@ -105,6 +127,15 @@ describe('matchesAnyPathFilter', () => {
     expect(matchesAnyPathFilter('https://x.com/category/foo', ['/product/', '/item/'])).toBe(false);
   });
 
+  it('matches only the pathname and fails closed for malformed URLs', () => {
+    const filters = ['/produto/'];
+
+    expect(matchesAnyPathFilter('https://x.com/busca?next=/produto/144583', filters)).toBe(false);
+    expect(matchesAnyPathFilter('https://x.com/busca#/produto/144583', filters)).toBe(false);
+    expect(matchesAnyPathFilter('https://x.com/produto/144583?next=/busca', filters)).toBe(true);
+    expect(matchesAnyPathFilter('not-a-url/produto/144583', filters)).toBe(false);
+  });
+
   // Documents a known tradeoff for the carrefour_br fix: `/p` over-matches
   // non-product paths like `/promo/`, `/pages/`, `/popular/`, `/help/`.
   // Acceptable because (a) the host check already pins us to the storefront,
@@ -120,5 +151,75 @@ describe('matchesAnyPathFilter', () => {
     expect(matchesAnyPathFilter('https://mercado.carrefour.com.br/promocoes/semana', filters)).toBe(true);
     expect(matchesAnyPathFilter('https://mercado.carrefour.com.br/pages/about', filters)).toBe(true);
     expect(matchesAnyPathFilter('https://mercado.carrefour.com.br/popular/today', filters)).toBe(true);
+  });
+});
+
+describe('matchesRequiredPathSegments', () => {
+  it('passes any URL when no segments are configured', () => {
+    expect(matchesRequiredPathSegments('https://www.noon.com/uae-en/milk/N1/p/', [])).toBe(true);
+  });
+
+  it('admits the configured storefront on both noon hosts', () => {
+    expect(matchesRequiredPathSegments('https://www.noon.com/saudi-en/milk/N1/p/', ['/saudi-en/'])).toBe(true);
+    expect(matchesRequiredPathSegments('https://minutes.noon.com/saudi-en/now-product/milk-1', ['/saudi-en/'])).toBe(
+      true,
+    );
+  });
+
+  it('rejects a foreign storefront on the same hosts', () => {
+    expect(matchesRequiredPathSegments('https://www.noon.com/uae-en/milk/N1/p/', ['/saudi-en/'])).toBe(false);
+    expect(matchesRequiredPathSegments('https://minutes.noon.com/egypt-en/now-product/milk-1', ['/saudi-en/'])).toBe(
+      false,
+    );
+  });
+
+  it('matches the pathname only, so query and fragment cannot satisfy it', () => {
+    expect(matchesRequiredPathSegments('https://www.noon.com/uae-en/milk/N1/p/?ref=/saudi-en/', ['/saudi-en/'])).toBe(
+      false,
+    );
+    expect(matchesRequiredPathSegments('https://www.noon.com/uae-en/milk/N1/p/#/saudi-en/', ['/saudi-en/'])).toBe(
+      false,
+    );
+  });
+
+  it('requires every listed segment, not any', () => {
+    expect(matchesRequiredPathSegments('https://x.example/saudi-en/p/', ['/saudi-en/', '/grocery/'])).toBe(false);
+    expect(matchesRequiredPathSegments('https://x.example/saudi-en/grocery/p/', ['/saudi-en/', '/grocery/'])).toBe(true);
+  });
+
+  it('fails closed on a malformed URL', () => {
+    expect(matchesRequiredPathSegments('not-a-url', ['/saudi-en/'])).toBe(false);
+    expect(matchesRequiredPathSegments('', ['/saudi-en/'])).toBe(false);
+  });
+});
+
+describe('looksLikeQuantityAsPrice', () => {
+  it('rejects a quantity echoed as a price for weighted products', () => {
+    expect(looksLikeQuantityAsPrice(400, '400g', { baseUnit: 'g' })).toBe(true);
+    expect(looksLikeQuantityAsPrice(1000, '1kg', { baseUnit: 'g' })).toBe(true);
+    expect(looksLikeQuantityAsPrice(400, undefined, { baseUnit: 'g' }, 'White Bread 400g')).toBe(true);
+  });
+
+  it('does not reject normal prices or count-based products', () => {
+    expect(looksLikeQuantityAsPrice(4.95, '500g', { baseUnit: 'g' })).toBe(false);
+    expect(looksLikeQuantityAsPrice(12, '12 ct', { baseUnit: 'ct' })).toBe(false);
+  });
+
+  // The canonical-name fallback must fire whenever sizeText does not PARSE,
+  // not only when it is absent — `??` would let these through.
+  it('falls back to the canonical size when sizeText is blank or unparseable', () => {
+    expect(looksLikeQuantityAsPrice(400, '', { baseUnit: 'g' }, 'White Bread 400g')).toBe(true);
+    expect(looksLikeQuantityAsPrice(400, '   ', { baseUnit: 'g' }, 'White Bread 400g')).toBe(true);
+    // `loaf` and `pack` are absent from UNIT_MAP, so parseSize returns null.
+    // (`gm` used to sit here; #6267 mapped it to grams, which would have let
+    // this case pass through the direct path and stop exercising the fallback.)
+    expect(looksLikeQuantityAsPrice(400, '400 loaf', { baseUnit: 'g' }, 'White Bread 400g')).toBe(true);
+    expect(looksLikeQuantityAsPrice(400, '24 pack', { baseUnit: 'g' }, 'White Bread 400g')).toBe(true);
+  });
+
+  it('still prefers a parseable sizeText over the canonical name', () => {
+    // Real 2kg pack priced 400: the page size disagrees with the price, so this
+    // is a genuine price, not an echo — the canonical 400g must not override it.
+    expect(looksLikeQuantityAsPrice(400, '2kg', { baseUnit: 'g' }, 'White Bread 400g')).toBe(false);
   });
 });

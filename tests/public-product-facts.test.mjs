@@ -1,19 +1,130 @@
 import { describe, it } from 'node:test';
+import { guardProBuiltOutput, withoutUnbuiltProPaths } from './_lib/pro-built-output.mjs';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TOOL_REGISTRY } from '../api/mcp/registry/index.ts';
 import { PRODUCT_CATALOG } from '../convex/config/productCatalog.ts';
+import {
+  ACQUISITION_CLAIM_ROOTS,
+  collectCurrentAcquisitionClaimFiles,
+  computeStats,
+  retainedExactContractCoverageFailures,
+  validateVolatileInventoryClaims,
+  VOLATILE_INVENTORY_CLAIM_RE,
+} from '../scripts/docs-stats.mjs';
+import { buildInventoryFacts, generateInventoryFacts, loadStatsForInventoryFacts } from '../scripts/generate-inventory-facts.mjs';
+import { buildSourceAttributionStats, checkSourceAttribution } from '../scripts/source-attribution.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (path) => readFileSync(resolve(ROOT, path), 'utf8');
 const readJson = (path) => JSON.parse(read(path));
 
+function makeInventoryFixture({ malformed = false } = {}) {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), 'wm-inventory-fixture-'));
+  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: ROOT, encoding: 'utf8' });
+  for (const path of tracked.split('\0').filter(Boolean)) {
+    mkdirSync(dirname(join(fixtureRoot, path)), { recursive: true });
+    cpSync(join(ROOT, path), join(fixtureRoot, path), { recursive: true, verbatimSymlinks: true });
+  }
+  const manifest = readJson('shared/source-attribution-manifest.json');
+  const entry = manifest.entries.find((row) => row.observed && row.kind === 'structured');
+  assert.ok(entry, 'fixture needs an observed structured source');
+  entry.references = [{ path: 'scripts/stale-source.mjs' }];
+  if (malformed) entry.kind = 'not-a-source-kind';
+  writeFileSync(join(fixtureRoot, 'shared/source-attribution-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return fixtureRoot;
+}
+
+function runInventoryFixture(fixtureRoot, script = 'scripts/generate-inventory-facts.mjs', args = []) {
+  return spawnSync(process.execPath, [script, ...args], {
+    cwd: fixtureRoot,
+    encoding: 'utf8',
+    timeout: 30_000,
+    env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot },
+  });
+}
+
 const registryToolNames = () => TOOL_REGISTRY.map((tool) => tool.name);
 const registryToolCount = () => TOOL_REGISTRY.length;
+const advertisedAgentCardToolCount = () => {
+  const routingSkill = readJson('public/.well-known/agent-card.json').skills
+    ?.find((skill) => skill.id === 'route-to-tool');
+  assert.ok(routingSkill?.description, 'A2A routing skill must have a description');
+  const count = routingSkill.description.match(/\b(\d+)-tool catalog\b/);
+  assert.ok(count, 'A2A routing skill must advertise an N-tool catalog');
+  return Number.parseInt(count[1], 10);
+};
 const displayPrice = (price) => (Number.isInteger(price) ? String(price) : price.toFixed(2));
+
+const REQUIRED_ACQUISITION_CLAIM_ROOTS = [
+  'README.ja-JP.md',
+  'README.md',
+  'README.zh-CN.md',
+  'blog-site/src/content/blog',
+  'cli',
+  'docs',
+  'index.html',
+  'pro-test/index.html',
+  'pro-test/src/locales',
+  'pro-test/welcome.html',
+  'public',
+  'public/.well-known/agent-skills',
+  'public/.well-known/ai-catalog.json',
+  'public/api/llms.txt',
+  'scripts/build-agent-skills-index.mjs',
+  'server.json',
+];
+
+function assertAcquisitionClaimRootClosure(actualRoots) {
+  assert.deepEqual([...actualRoots].sort(), REQUIRED_ACQUISITION_CLAIM_ROOTS);
+}
+
+const REQUIRED_CURRENT_DOC_EXCLUDES = [
+  'docs/Docs_To_Review/',
+  'docs/api/',
+  'docs/archive/',
+  'docs/audits/',
+  'docs/brainstorms/',
+  'docs/generated/',
+  'docs/ideation/',
+  'docs/internal/',
+  'docs/perf/',
+  'docs/plans/',
+  'docs/research/',
+  'docs/solutions/',
+];
+
+function independentlyCollectCurrentDocs() {
+  const paths = [];
+  const visit = (path) => {
+    if (REQUIRED_CURRENT_DOC_EXCLUDES.some((prefix) => path.startsWith(prefix))) return;
+    if (['docs/changelog.mdx', 'docs/desktop-parity-matrix.md', 'docs/railway-seed-consolidation-runbook.md', 'docs/source-attribution.mdx', 'docs/zh/changelog.mdx'].includes(path)) return;
+    const stat = statSync(join(ROOT, path));
+    if (stat.isDirectory()) {
+      for (const entry of readdirSync(join(ROOT, path))) visit(`${path}/${entry}`);
+      return;
+    }
+    if (/\.(?:md|mdx)$/.test(path)) paths.push(path);
+  };
+  visit('docs');
+  return paths.sort();
+}
 
 function machineReadablePricing() {
   const match = read('public/pricing.md').match(
@@ -36,6 +147,8 @@ function applicationJsonLd(path) {
 
 const ACQUISITION_ROOTS = [
   'index.html',
+  'README.md',
+  'README.zh-CN.md',
   'server.json',
   'cli',
   'docs',
@@ -56,7 +169,13 @@ const ACQUISITION_EXCLUDES = [
   'docs/plans/',
   'pro-test/node_modules/',
   'public/blog/',
-  'public/pro/assets/',
+  // public/pro/ joins public/blog/ here for the same reason (#6898): both are
+  // BUILT output, so a filesystem walk would silently scan a larger or smaller
+  // population depending on whether someone ran the build -- shrinking the
+  // surface set without ever reporting a skip. The sources these compile from
+  // (pro-test/index.html, pro-test/welcome.html, pro-test/src/locales/) are
+  // committed and stay in scope, so nothing is actually left unchecked.
+  'public/pro/',
   'public/openapi',
 ];
 
@@ -77,68 +196,276 @@ function collectAcquisitionSurfaces() {
 }
 
 const CURRENT_FACT_SURFACES = collectAcquisitionSurfaces();
-
 describe('public product facts generation contract', () => {
-  it('publishes generated lifecycle, pricing, and capability facts', () => {
-    const sharedFacts = readJson('shared/product-facts.generated.json');
-    const publicFacts = readJson('public/product-facts.json');
+  // Two cases below read the built public/pro/ pages, which `npm run build:pro`
+  // produces rather than git (#6898). They drop those paths in an unbuilt
+  // checkout; this makes CI fail instead when it says it built them.
+  guardProBuiltOutput();
 
-    assert.deepEqual(publicFacts, sharedFacts);
-    assert.equal(sharedFacts.product.lifecycle, 'launched');
-    assert.equal(sharedFacts.product.pricingUrl, 'https://www.worldmonitor.app/pro#pricing');
-    assert.equal(sharedFacts.product.primaryCtaLabel, 'View Pro plans');
-    assert.equal(sharedFacts.currency, 'USD');
-    assert.equal(sharedFacts.capabilities.mcpTools, registryToolCount());
+  it('keeps the acquisition claim scan on the complete registered root set', () => {
+    assertAcquisitionClaimRootClosure(ACQUISITION_CLAIM_ROOTS);
+    assert.throws(
+      () => assertAcquisitionClaimRootClosure(
+        ACQUISITION_CLAIM_ROOTS.filter((path) => path !== 'README.ja-JP.md'),
+      ),
+      /Expected values to be strictly deep-equal/,
+      'deleting one registered acquisition root must fail closed',
+    );
+  });
+
+  it('keeps recursive current documentation in the exact acquisition scan closure', () => {
+    const expected = independentlyCollectCurrentDocs();
+    const actual = collectCurrentAcquisitionClaimFiles().filter((path) => path.startsWith('docs/'));
+    assert.deepEqual(actual, expected);
+    assert.ok(actual.includes('docs/panels/news-feeds.mdx'), 'nested panel docs must be scanned');
+    assert.throws(
+      () => assert.deepEqual(actual.filter((path) => path !== 'docs/panels/news-feeds.mdx'), expected),
+      /Expected values to be strictly deep-equal/,
+      'deleting one nested current documentation surface must fail closed',
+    );
+  });
+
+  it('fails closed when a retained exact contract disappears', () => {
+    const contract = { path: 'docs/fixed-protocol.mdx', text: /six fixed fields/ };
+    assert.deepEqual(retainedExactContractCoverageFailures([contract], new Set([contract])), []);
+    assert.deepEqual(
+      retainedExactContractCoverageFailures([contract], new Set()),
+      ['docs/fixed-protocol.mdx: retained exact count contract is missing or changed: /six fixed fields/'],
+    );
+  });
+
+  it('fails closed when any published inventory extractor collapses to zero', () => {
+    const stats = computeStats();
+    const capabilityStatKeys = [
+      'mcpToolCount',
+      'locales',
+      'variantCount',
+      'layerDefinitions',
+      'panelClasses',
+      'feedDefinitions',
+      'freshnessSources',
+      'sourceAttributionHosts',
+    ];
+    for (const key of capabilityStatKeys) {
+      assert.throws(
+        () => buildInventoryFacts({ ...stats, [key]: 0 }),
+        /must be a positive integer/,
+        `${key} parser collapse must fail generation`,
+      );
+    }
+    assert.throws(
+      () => buildInventoryFacts({
+        ...stats,
+        sourceAttribution: { ...stats.sourceAttribution, providerCount: 0 },
+      }),
+      /must be a positive integer/,
+      'provider parser collapse must fail generation',
+    );
+    assert.throws(
+      () => buildInventoryFacts({ ...stats, localeCodes: [] }),
+      /localeCodes must be a non-empty unique locale-code registry/,
+      'locale membership extraction must not collapse while its count stays positive',
+    );
+  });
+
+  it('fails the inventory check for missing or stale build outputs', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'wm-inventory-facts-'));
+    mkdirSync(join(tempRoot, 'api'));
+    mkdirSync(join(tempRoot, 'public'));
+    const expected = new Map([
+      ['api/_inventory-facts.generated.js', 'edge'],
+      ['public/product-facts.json', 'public'],
+    ]);
+    try {
+      assert.throws(
+        () => generateInventoryFacts({ check: true, outputs: expected, rootDir: tempRoot }),
+        /missing or stale: api\/_inventory-facts\.generated\.js, public\/product-facts\.json/,
+      );
+      generateInventoryFacts({ outputs: expected, rootDir: tempRoot });
+      assert.doesNotThrow(() => (
+        generateInventoryFacts({ check: true, outputs: expected, rootDir: tempRoot })
+      ));
+      writeFileSync(join(tempRoot, 'api/_inventory-facts.generated.js'), 'stale');
+      assert.throws(
+        () => generateInventoryFacts({ check: true, outputs: expected, rootDir: tempRoot }),
+        /missing or stale: api\/_inventory-facts\.generated\.js/,
+      );
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('stops consumers on an interrupted publication and repairs it on the next run', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'wm-inventory-facts-interrupted-'));
+    mkdirSync(join(tempRoot, 'api'));
+    mkdirSync(join(tempRoot, 'public'));
+    const expected = new Map([
+      ['api/_inventory-facts.generated.js', 'edge'],
+      ['public/product-facts.json', 'public'],
+    ]);
+    let renames = 0;
+    let consumerRan = false;
+    const interruptedFileOps = {
+      mkdirSync,
+      writeFileSync,
+      unlinkSync,
+      renameSync(from, to) {
+        renames += 1;
+        if (renames === 2) throw new Error('simulated publication interruption');
+        renameSync(from, to);
+      },
+    };
+    try {
+      assert.throws(() => {
+        generateInventoryFacts({ outputs: expected, rootDir: tempRoot, fileOps: interruptedFileOps });
+        consumerRan = true;
+      }, /simulated publication interruption/);
+      assert.equal(consumerRan, false, 'a failed generator must stop the next consumer command');
+      assert.equal(readFileSync(join(tempRoot, 'api/_inventory-facts.generated.js'), 'utf8'), 'edge');
+      assert.equal(existsSync(join(tempRoot, `public/product-facts.json.tmp-${process.pid}`)), false);
+      assert.throws(
+        () => generateInventoryFacts({ check: true, outputs: expected, rootDir: tempRoot }),
+        /public\/product-facts\.json/,
+      );
+      generateInventoryFacts({ outputs: expected, rootDir: tempRoot });
+      assert.doesNotThrow(() => generateInventoryFacts({ check: true, outputs: expected, rootDir: tempRoot }));
+    } finally {
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes all default inventory outputs from a stale but structurally valid attribution ledger', () => {
+    const fixtureRoot = makeInventoryFixture();
+    try {
+      const strict = checkSourceAttribution(fixtureRoot);
+      assert.ok(strict.errors.length > 0, 'strict source attribution checking must remain red for parity drift');
+      assert.match(strict.errors.join('\n'), /stale manifest entry/);
+
+      const result = runInventoryFixture(fixtureRoot);
+      assert.equal(result.status, 0, result.stderr);
+      const outputs = [
+        'public/product-facts.json',
+        'scripts/shared/inventory-facts.generated.json',
+        'api/_inventory-facts.generated.js',
+        'docs/generated/stats.json',
+      ];
+      const original = outputs.map((path) => readFileSync(join(fixtureRoot, path), 'utf8'));
+      const publicFacts = JSON.parse(original[0]);
+      const relayFacts = JSON.parse(original[1]);
+      const stats = JSON.parse(original[3]);
+      assert.deepEqual(publicFacts.capabilities, relayFacts.capabilities);
+      assert.equal(publicFacts.capabilities.sourceAttributionHosts, stats.sourceAttributionHosts);
+      assert.equal(stats.sourceAttributionHosts, buildSourceAttributionStats({ rootDir: fixtureRoot, validate: false }).activeHosts);
+      const edge = runInventoryFixture(fixtureRoot, '--input-type=module', ['-e',
+        "import { PUBLIC_INVENTORY_FACTS } from './api/_inventory-facts.generated.js'; console.log(JSON.stringify(PUBLIC_INVENTORY_FACTS));",
+      ]);
+      assert.equal(edge.status, 0, edge.stderr);
+      assert.deepEqual(JSON.parse(edge.stdout), relayFacts);
+      assert.match(result.stderr, /proceeding with committed attribution counts/);
+      for (const args of [[], ['--check']]) {
+        const replay = runInventoryFixture(fixtureRoot, 'scripts/generate-inventory-facts.mjs', args);
+        assert.equal(replay.status, 0, replay.stderr);
+        assert.deepEqual(outputs.map((path) => readFileSync(join(fixtureRoot, path), 'utf8')), original);
+      }
+      const strictCli = runInventoryFixture(fixtureRoot, 'scripts/source-attribution.mjs', ['--check']);
+      assert.notEqual(strictCli.status, 0, 'bootstrap must not weaken the strict attribution gate');
+      assert.match(strictCli.stderr + strictCli.stdout, /stale manifest entry/);
+
+      writeFileSync(join(fixtureRoot, 'src/config/finance-geo.ts'), 'export const UNRELATED = [];\n');
+      const brokenInventory = runInventoryFixture(fixtureRoot);
+      assert.notEqual(brokenInventory.status, 0);
+      assert.match(brokenInventory.stderr, /could not isolate STOCK_EXCHANGES/);
+      assert.deepEqual(outputs.map((path) => readFileSync(join(fixtureRoot, path), 'utf8')), original);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not swallow non-attribution inventory failures', () => {
+    assert.throws(
+      () => loadStatsForInventoryFacts({
+        compute: () => {
+          throw new Error('docs-stats: could not isolate STOCK_EXCHANGES block');
+        },
+      }),
+      /STOCK_EXCHANGES/,
+    );
+  });
+
+  it('does not publish inventory outputs from a malformed attribution ledger', () => {
+    const fixtureRoot = makeInventoryFixture({ malformed: true });
+    try {
+      const strict = checkSourceAttribution(fixtureRoot);
+      assert.ok(strict.errors.length > 0, 'strict source attribution checking must reject malformed ledger entries');
+      assert.match(strict.errors.join('\n'), /invalid manifest kind/);
+
+      const result = runInventoryFixture(fixtureRoot);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /invalid manifest kind/);
+      for (const path of [
+        'public/product-facts.json',
+        'scripts/shared/inventory-facts.generated.json',
+        'api/_inventory-facts.generated.js',
+        'docs/generated/stats.json',
+      ]) {
+        assert.equal(existsSync(join(fixtureRoot, path)), false, `malformed ledger published ${path}`);
+      }
+      assert.doesNotMatch(result.stderr, /proceeding with committed attribution counts/);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps stable product facts separate from build-owned inventory facts', () => {
+    const stableFacts = readJson('shared/product-facts.generated.json');
+    const publicFacts = readJson('public/product-facts.json');
+    const relayInventory = readJson('scripts/shared/inventory-facts.generated.json');
+    const stats = computeStats();
+
+    assert.equal(stableFacts.capabilities, undefined);
+    assert.equal(readJson('shared/product-catalog.generated.json').facts.capabilities, undefined);
+    assert.deepEqual(
+      Object.fromEntries(Object.entries(publicFacts).filter(([key]) => key !== 'capabilities')),
+      stableFacts,
+    );
+    assert.deepEqual(publicFacts.capabilities, relayInventory.capabilities);
+    assert.deepEqual(publicFacts.capabilities, {
+      mcpTools: stats.mcpToolCount,
+      locales: stats.locales,
+      variants: stats.variantCount,
+      mapLayers: stats.layerDefinitions,
+      panelImplementations: stats.panelClasses,
+      feedDefinitions: stats.feedDefinitions,
+      freshnessTrackedSourceGroups: stats.freshnessSources,
+      sourceAttributionHosts: stats.sourceAttributionHosts,
+      sourceAttributionProviders: stats.sourceAttribution.providerCount,
+      localeCodes: stats.localeCodes,
+    });
+    assert.equal(stableFacts.product.lifecycle, 'launched');
+    assert.equal(stableFacts.product.pricingUrl, 'https://www.worldmonitor.app/pro#pricing');
+    assert.equal(stableFacts.product.primaryCtaLabel, 'View Pro plans');
+    assert.equal(stableFacts.currency, 'USD');
     const serverCardNames = readJson('public/.well-known/mcp/server-card.json')
       .tools
       .map((tool) => tool.name);
     assert.deepEqual(serverCardNames.sort(), registryToolNames().sort());
-    assert.equal(readJson('docs/generated/stats.json').mcpToolCount, registryToolCount());
-    assert.equal(readJson('public/agent-view.json').endpoints.mcp.tools, registryToolCount());
-    for (const localePath of [
-      'pro-test/src/locales/en.json',
-      'pro-test/src/locales/fa.json',
-    ]) {
-      assert.equal(
-        Number(readJson(localePath).welcome.depth.s12v),
-        registryToolCount(),
-        `${localePath} publishes a stale MCP depth statistic`,
-      );
-    }
+    assert.equal(stats.mcpToolCount, registryToolCount());
 
-    const proMonthly = sharedFacts.plans.find((plan) => plan.planKey === 'pro_monthly');
-    const proAnnual = sharedFacts.plans.find((plan) => plan.planKey === 'pro_annual');
+    const proMonthly = stableFacts.plans.find((plan) => plan.planKey === 'pro_monthly');
+    const proAnnual = stableFacts.plans.find((plan) => plan.planKey === 'pro_annual');
     assert.equal(proMonthly.price, PRODUCT_CATALOG.pro_monthly.priceCents / 100);
     assert.equal(proMonthly.billingDuration, 'P1M');
     assert.equal(proAnnual.price, PRODUCT_CATALOG.pro_annual.priceCents / 100);
     assert.equal(proAnnual.billingDuration, 'P1Y');
-    for (const plan of sharedFacts.plans.filter((candidate) => candidate.price != null)) {
+    for (const plan of stableFacts.plans.filter((candidate) => candidate.price != null)) {
       assert.equal(plan.priceCurrency, 'USD');
       assert.equal(plan.availability, 'https://schema.org/InStock');
-      assert.equal(plan.url, sharedFacts.product.pricingUrl);
+      assert.equal(plan.url, stableFacts.product.pricingUrl);
     }
   });
 
-  it('keeps every exact MCP count on a current public surface aligned to the registry', () => {
-    const expected = registryToolCount();
-    let claimCount = 0;
-    for (const path of CURRENT_FACT_SURFACES) {
-      const source = read(path);
-      const claims = [
-        ...source.matchAll(/\b(\d+)(?=-tool MCP server\b)/g),
-        ...source.matchAll(/\b(\d+)(?=\s+MCP tools\b)/g),
-        ...source.matchAll(/\b(\d+)(?=\s+(?:live\s+)?(?:geopolitical intelligence\s+)?tools\b)/g),
-        ...source.matchAll(/\b(\d+)\+(?=\s+(?:MCP\s+)?tools\b)/g),
-        ...source.matchAll(/\b(\d+)(?=\s+\[MCP tools\])/g),
-        ...source.matchAll(/\b(\d+)(?=\s+tool definitions\b)/g),
-        ...source.matchAll(/\b(\d+)(?=\s*个\s*(?:MCP\s*)?(?:实时|压缩的)?工具)/g),
-      ];
-      for (const claim of claims) {
-        claimCount += 1;
-        assert.equal(Number(claim[1]), expected, `${path} publishes a stale MCP tool count`);
-      }
-    }
-    assert.ok(claimCount >= 25, 'expected exact MCP counts across the public acquisition corpus');
+  it('keeps the A2A routing card tool count aligned with the live registry', () => {
+    assert.equal(advertisedAgentCardToolCount(), registryToolCount());
   });
 
   it('removes stale waitlist lifecycle terms from current acquisition surfaces', () => {
@@ -160,6 +487,77 @@ describe('public product facts generation contract', () => {
       assert.equal(locale.footer?.beFirstInLine, undefined, `${name}: legacy queue copy`);
       assert.equal(locale.form, undefined, `${name}: legacy waitlist form copy`);
       assert.equal(locale.referral, undefined, `${name}: legacy waitlist referral copy`);
+      // The "Under the hood" band renders measured numerals (depth-stats.json),
+      // so the retired adjective value slots must not linger in any locale —
+      // a future re-wiring to t('welcome.depth.sNv') would resurrect the
+      // non-numeric band the subhead's "every number below is live" contradicts.
+      for (let slot = 1; slot <= 15; slot += 1) {
+        assert.equal(locale.welcome?.depth?.[`s${slot}v`], undefined, `${name}: retired depth slot value s${slot}v`);
+      }
+    }
+  });
+
+  it('keeps volatile inventory totals out of hand-authored acquisition copy', () => {
+    const violations = validateVolatileInventoryClaims();
+    assert.deepEqual(
+      violations,
+      [],
+      `hand-authored acquisition copy must use registry-derived or semantic inventory wording:\n${violations.join('\n')}`,
+    );
+    for (const claim of [
+      '30+ live services',
+      '500+ curated news feeds',
+      '25+ other live services',
+      '12+ data source credentials',
+      'MCP offers 52 tools',
+      'There are 445 API handlers',
+      '80+ Vercel Edge Functions',
+      '190+ documented operations',
+      '24 typed services',
+      '26 OSINT channels',
+      '31 live webcams',
+      'seven live news channels',
+      'Panels: 102',
+      'six specialized variants',
+      'five dashboard variants',
+      'five interchangeable surfaces',
+      '34 proto-backed domains',
+      '27 positive-news feeds',
+      '28 supported languages',
+      '44 data layers',
+      '44 other intelligence layers',
+      '20+ separate services',
+      '| Live video streams | 8 |',
+      '| Languages supported | 27 (including RTL) |',
+      '| Airports monitored | 111 |',
+      '52個のMCPツール',
+      '52個のMCPツールも使える',
+      '52個のMCPツールから選べる',
+      '52個のMCPツールまで対応',
+      '52個のMCPツールより多い',
+      '60以上のVercel Edge Functions',
+      '6つのダッシュボード',
+      '313のAIデータセンターを電力・運営者メタデータ付きでマッピング',
+      '26 个 OSINT 频道',
+      '210+ military bases',
+      '38+ associated military bases',
+      '9 strategic theaters',
+      '210+ 基地数据库',
+      '56-channel Telegram OSINT feed',
+      '62 strategic ports',
+      '88 mapped pipelines',
+      '13 monitored waterways',
+      '~100 tracked satellites',
+      '80–120 intelligence satellites',
+      '25 installable agent skills',
+      '跨 30+ 实时服务',
+      '500 多个实时数据源',
+      '25 个可安装智能体技能',
+      '25 个公开智能体配方',
+      'Vercel Edge Functions（60+）',
+      'Vercel Edge Functions (60 以上)',
+    ]) {
+      assert.match(claim, VOLATILE_INVENTORY_CLAIM_RE, `modifier form must remain guarded: ${claim}`);
     }
   });
 
@@ -192,9 +590,9 @@ describe('public product facts generation contract', () => {
     const apiAnnual = displayPrice(plans.api_starter_annual.price);
     const businessMonthly = displayPrice(plans.api_business.price);
     // The Pro app reads the generated tier values asserted above; the welcome
-    // source and its committed SSR output also surface the monthly entry price.
+    // source and its built SSR output also surface the monthly entry price.
     // Do not require the prerender script to carry a second crawler-only copy.
-    for (const path of ['pro-test/welcome.html', 'public/pro/welcome.html']) {
+    for (const path of withoutUnbuiltProPaths(['pro-test/welcome.html', 'public/pro/welcome.html'])) {
       assert.match(read(path), new RegExp(`\\$${proMonthly.replace('.', '\\.')}[^\\d]`), `${path}: Pro monthly`);
     }
 
@@ -215,17 +613,17 @@ describe('public product facts generation contract', () => {
     assert.equal(summaryPlans['API Business'].price_usd_monthly, plans.api_business.price);
   });
 
-  it('publishes valid, available, canonical offers in source and committed HTML', () => {
+  it('publishes valid, available, canonical offers in source and built HTML', () => {
     const facts = readJson('shared/product-facts.generated.json');
     const pricingUrl = facts.product.pricingUrl;
     const plansByName = new Map(facts.plans.map((plan) => [plan.name, plan]));
-    for (const path of [
+    for (const path of withoutUnbuiltProPaths([
       'index.html',
       'pro-test/index.html',
       'pro-test/welcome.html',
       'public/pro/index.html',
       'public/pro/welcome.html',
-    ]) {
+    ])) {
       const application = applicationJsonLd(path);
       assert.ok(Array.isArray(application.offers) && application.offers.length >= 3);
       for (const offer of application.offers) {
@@ -248,13 +646,103 @@ describe('public product facts generation contract', () => {
     }
   });
 
-  it('keeps committed generated facts fresh', () => {
+  it('keeps stable and build-owned generated facts fresh', () => {
     assert.doesNotThrow(() => {
       execFileSync(
         process.execPath,
         ['--import', 'tsx', 'scripts/generate-public-product-facts.mjs', '--check'],
         { cwd: ROOT, stdio: 'pipe' },
       );
+      execFileSync(
+        process.execPath,
+        ['scripts/generate-inventory-facts.mjs', '--check'],
+        { cwd: ROOT, stdio: 'pipe' },
+      );
     });
+  });
+
+  it('derives hero proof stats from live registries, not literals', async () => {
+    const { getCompleteLayerCatalogKeys } = await import('../src/config/map-layer-definitions.ts');
+    const { loadManifest, scanUpstreamHosts, sourceAttributionStats } = await import('../scripts/source-attribution.mjs');
+    const facts = readJson('shared/product-facts.generated.json');
+    const stats = sourceAttributionStats(scanUpstreamHosts(ROOT), loadManifest(ROOT));
+    assert.equal(facts.heroProofStats.mapLayers, getCompleteLayerCatalogKeys('full').length);
+    assert.equal(facts.heroProofStats.feeds, stats.feedHosts);
+    assert.equal(facts.heroProofStats.providers, stats.providerCount);
+    assert.equal(facts.heroProofStats.alertOrigins, 5);
+  });
+
+  it('derives depth proof stats from live registries, not literals', async () => {
+    // The "Under the hood" band sits under a subhead promising "Every number
+    // below is live in the dashboard today" (#7745). Each slot must equal its
+    // registry — the same sources build-ai-search.mjs publishes in ai-search.md.
+    const { AI_DATA_CENTERS } = await import('../src/config/ai-datacenters.ts');
+    const { CHOKEPOINT_REGISTRY } = await import('../src/config/chokepoint-registry.ts');
+    const { UNDERSEA_CABLES } = await import('../src/config/geo-map.ts');
+    const { getCompleteLayerCatalogKeys } = await import('../src/config/map-layer-definitions.ts');
+    const { INTEL_HOTSPOTS } = await import('../shared/geo-data.ts');
+    const { PIPELINES } = await import('../shared/pipelines-data.ts');
+    const { lngFacilityCount } = await import('../scripts/_storage-facility-registry.mjs');
+    const { publishedRankedCountries } = await import('../scripts/build-ai-search.mjs');
+    const { commandPaletteCommandCount } = await import('../scripts/lib/command-palette-count.mjs');
+    const facts = readJson('shared/product-facts.generated.json');
+    const depth = facts.depthProofStats;
+    const stats = computeStats();
+    assert.equal(depth.mapLayers, getCompleteLayerCatalogKeys('full').length);
+    assert.equal(depth.chokepoints, CHOKEPOINT_REGISTRY.length);
+    assert.equal(depth.instabilityCountries, stats.tier1Countries);
+    assert.equal(depth.resilienceRanked, publishedRankedCountries(ROOT).ranked);
+    assert.equal(depth.submarineCables, UNDERSEA_CABLES.length);
+    assert.equal(depth.pipelinesLng, PIPELINES.length + lngFacilityCount());
+    assert.match(
+      read('public/ai-search.md'),
+      new RegExp(`- ${PIPELINES.length + lngFacilityCount()} pipelines and LNG assets`),
+    );
+    assert.equal(depth.aiDatacenters, AI_DATA_CENTERS.length);
+    assert.equal(depth.hotspots, INTEL_HOTSPOTS.length);
+    assert.equal(depth.stockExchanges, stats.stockExchangeCount);
+    assert.equal(depth.mcpTools, TOOL_REGISTRY.length);
+    assert.equal(depth.commands, commandPaletteCommandCount());
+    assert.equal(
+      readJson('pro-test/src/locales/en.json').welcome.depth.s13l,
+      '⌘K command definitions',
+    );
+    assert.equal(depth.languages, stats.locales);
+    // Slots whose labels match the hero rail publish the same figures.
+    assert.equal(depth.feeds, facts.heroProofStats.feeds);
+    assert.equal(depth.providers, facts.heroProofStats.providers);
+    assert.equal(depth.alertOrigins, facts.heroProofStats.alertOrigins);
+  });
+
+  it('fails closed when the command palette registry cannot be counted', async () => {
+    const { commandPaletteCommandCount } = await import('../scripts/lib/command-palette-count.mjs');
+    assert.throws(
+      () => commandPaletteCommandCount({ source: 'export const UNRELATED = 1;' }),
+      /could not isolate the COMMANDS array/,
+    );
+  });
+
+  it('renders the Under the hood band from generated numerals, not locale adjectives', () => {
+    const source = read('pro-test/src/welcome/Depth.tsx');
+    assert.match(
+      source,
+      /import depthProofStats from '\.\.\/generated\/depth-stats\.json';/,
+      'the band must render build-time measured numerals',
+    );
+    assert.doesNotMatch(
+      source,
+      /s\$\{n\}v/,
+      'depth slot values must not be read back out of locale keys',
+    );
+    assert.match(source, /welcome\.depth\.s1l/, 'slot labels stay localized');
+    const depthStats = readJson('pro-test/src/generated/depth-stats.json');
+    assert.equal(Object.keys(depthStats).length, 15, 'all 15 band slots must carry a measured value');
+    for (const [key, value] of Object.entries(depthStats)) {
+      assert.equal(
+        Number.isInteger(value) && value > 0,
+        true,
+        `depth-stats.json slot ${key} must be a positive integer, got ${JSON.stringify(value)}`,
+      );
+    }
   });
 });

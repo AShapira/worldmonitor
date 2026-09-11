@@ -44,7 +44,6 @@ const PARAM_DESCRIPTION =
   'Optional JMESPath expression applied server-side to project or reduce the JSON response before it is returned (mirrors the MCP jmespath argument). Invalid expressions, expressions larger than 1024 UTF-8 bytes, or projections that exceed the 256 KB output cap return HTTP 400 with a {_jmespath_error, original_keys} envelope. Grammar and worked examples: https://www.worldmonitor.app/docs/mcp-jmespath.';
 const JMESPATH_ERROR_SCHEMA_NAME = 'JmespathProjectionError';
 const JMESPATH_ERROR_SCHEMA_REF = `#/components/schemas/${JMESPATH_ERROR_SCHEMA_NAME}`;
-
 // Canonical JSON parameter object. Key order is irrelevant — serialize() sorts
 // keys recursively, matching the generator's byte layout.
 function jmespathParam() {
@@ -241,7 +240,7 @@ function ensureYamlJmespathParam(lines, start, end) {
 
   let paramEnd = end;
   for (let i = paramIndex + 1; i < end; i++) {
-    if (/^ {16}- name: \S+/.test(lines[i]) || /^ {12}responses:\s*$/.test(lines[i])) {
+    if (/^ {16}- name: \S+/.test(lines[i]) || /^ {12}\S/.test(lines[i])) {
       paramEnd = i;
       break;
     }
@@ -319,11 +318,11 @@ for (const file of yamlFiles) {
 
 if (CHECK) {
   if (wouldChange > 0) {
-    console.error(`✗ ${wouldChange} OpenAPI artifact(s) missing the jmespath parameter: ${touched.join(', ')}`);
+    console.error(`✗ ${wouldChange} OpenAPI artifact(s) missing the eligible jmespath contract: ${touched.join(', ')}`);
     console.error('  Run: npm run gen:openapi:jmespath');
     process.exit(1);
   }
-  console.log('✓ jmespath projection parameter present on every GET operation');
+  console.log('✓ jmespath projection parameter present on every eligible GET operation');
 } else {
   console.log(`openapi-inject-jmespath: updated ${wouldChange} artifact(s)`);
 }

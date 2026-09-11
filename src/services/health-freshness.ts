@@ -20,13 +20,14 @@ interface HealthResponse {
   status?: string;
   checkedAt?: string;
   checks?: Record<string, HealthCheck>;
+  pending?: Record<string, HealthCheck>;
   problems?: Record<string, HealthCheck>;
 }
 
 // Detailed /api/health (full `checks`) is operator/enterprise-key-gated since
 // #4715 — an anonymous dashboard calling it 401s on every tick (#4902). The
-// compact variant is keyless: same per-check shape, but only non-OK entries
-// land in `problems` and healthy checks are omitted entirely.
+// compact variant is keyless: non-OK entries use the same per-check shape in
+// `problems` or `pending` during finite grace; healthy checks are omitted.
 const PUBLIC_HEALTH_ENDPOINT = '/api/health?compact=1';
 
 // One 401/403 per window is enough signal that the endpoint got (re-)gated;
@@ -46,11 +47,15 @@ export interface RefreshHealthFreshnessOptions {
   urlResolver?: (path: string) => string;
 }
 
+// Ranks are ordinal severity for "pick the worst status of a source". They mirror
+// the server's ok/warn/crit buckets (api/health.js STATUS_COUNTS): crit statuses
+// rank highest, warn statuses in the middle, ok statuses at 0.
 function statusRank(status: string): number {
   switch (status) {
     case 'SEED_ERROR':
     case 'REDIS_DOWN':
     case 'REDIS_PARTIAL':
+    case 'CHINA_UNAVAILABLE': // server: crit
       return 5;
     case 'EMPTY':
     case 'EMPTY_DATA':
@@ -58,19 +63,26 @@ function statusRank(status: string): number {
     case 'STALE_SEED':
     case 'STALE_CONTENT':
     case 'COVERAGE_PARTIAL':
+    case 'COVERAGE_DEGRADED': // server: warn
+    case 'CHINA_DEGRADED':    // server: warn
+    case 'ROLLOUT_PENDING':   // server: warn
       return 3;
     case 'EMPTY_ON_DEMAND':
       return 2;
     case 'OK_CASCADE':
       return 1;
     case 'OK':
-    // An optional source adapter this deployment never configured. Ranks with OK
-    // on purpose: it is not a degradation, so it must never outrank a real signal
-    // when picking the worst status for a data source.
+    // An optional source adapter this deployment never configured, or a source
+    // intentionally blocked in this build. Rank with OK on purpose: neither is a
+    // degradation, so it must never outrank a real signal.
     case 'NOT_CONFIGURED':
+    case 'SOURCE_BLOCKED': // server: ok
       return 0;
     default:
-      return 0;
+      // An unrecognized status must never be treated as OK when picking the worst
+      // status of a source — mirror the server's `?? 'warn'` fallback and rank it
+      // as a degradation so a new status surfaces instead of silently passing.
+      return 3;
   }
 }
 
@@ -90,10 +102,6 @@ function stalenessRatio(update: SeedHealthUpdate): number {
 
 function isRedisOutageStatus(status: string | undefined): status is 'REDIS_DOWN' | 'REDIS_PARTIAL' {
   return status === 'REDIS_DOWN' || status === 'REDIS_PARTIAL';
-}
-
-function getMappedSourceIds(): DataSourceId[] {
-  return getHealthMappedSourceIds();
 }
 
 export async function refreshDataFreshnessFromHealth(options: RefreshHealthFreshnessOptions = {}): Promise<number> {
@@ -136,11 +144,14 @@ export async function refreshDataFreshnessFromHealth(options: RefreshHealthFresh
   const checkedAtMs = payload.checkedAt ? Date.parse(payload.checkedAt) : Date.now();
   const checkedAt = Number.isFinite(checkedAtMs) ? checkedAtMs : Date.now();
   const updatesBySource = new Map<DataSourceId, SeedHealthUpdate>();
-  const checks: Record<string, HealthCheck> = payload.checks ?? { ...(payload.problems ?? {}) };
+  const checks: Record<string, HealthCheck> = payload.checks ?? {
+    ...(payload.pending ?? {}),
+    ...(payload.problems ?? {}),
+  };
 
   if (Object.keys(checks).length === 0 && isRedisOutageStatus(payload.status)) {
     const status = payload.status;
-    const updates = getMappedSourceIds().map((sourceId) => ({
+    const updates = getHealthMappedSourceIds().map((sourceId) => ({
       sourceId,
       status,
       records: 0,
@@ -150,8 +161,8 @@ export async function refreshDataFreshnessFromHealth(options: RefreshHealthFresh
     return updates.length;
   }
 
-  // Compact responses omit healthy checks (only non-OK entries land in
-  // `problems`), so a mapped check that is absent was evaluated server-side
+  // Compact responses omit healthy checks (non-OK entries land in `problems`
+  // or `pending`), so a mapped check absent from both was evaluated server-side
   // and found within budget. Synthesize OK-as-of-checkedAt for those:
   // seedAgeMin 0 is required because recordSeedHealth keeps lastUpdate null
   // on an age-less update and calculateStatus then reports no_data.

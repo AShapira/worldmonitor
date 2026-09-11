@@ -8,10 +8,14 @@ process.env.UPSTASH_REDIS_REST_TOKEN = 'test-token';
 
 const {
   afterPublish,
+  COUNTRY_ARTICLES_ACTIVATION_KEY,
+  COUNTRY_ARTICLES_META_KEY,
+  countryIndexRecordCount,
   fetchGdeltBulkFiles,
   fetchMaterializedGdelt,
   GDELT_BULK_ARTICLES_KEY,
   GDELT_BULK_CONFLICT_KEY,
+  GDELT_BULK_COUNTRY_ARTICLES_KEY,
   GDELT_BULK_STATE_KEY,
   GDELT_BULK_UNREST_KEY,
   GDELT_INTEL_KEY,
@@ -272,6 +276,7 @@ function publicationData() {
     _unrest: { events: [{ id: 'u1' }] },
     _positive: { events: [{ name: 'p1' }] },
     _reference: { articles: [{ title: 'r1' }] },
+    _countryIndex: { byCountry: { PW: [{ title: 'Palau signs maritime pact' }] }, fetchedAt: '2026-07-30T12:05:00.000Z' },
     _state: { cursor: { gkg: '20260730120000', export: '20260730120000' } },
   };
 }
@@ -327,6 +332,7 @@ describe('seed-gdelt-bulk-materializer fetch integration', () => {
         reads.push(key);
         if (key === GDELT_INTEL_KEY) return null;
         if (key === GDELT_BULK_STATE_KEY) return previousState;
+        if (key === GDELT_BULK_COUNTRY_ARTICLES_KEY) return null;
         throw new Error(`unexpected key ${key}`);
       },
       _fetchFiles: async ({ afterTimestamp }) => {
@@ -344,7 +350,7 @@ describe('seed-gdelt-bulk-materializer fetch integration', () => {
       },
     });
 
-    assert.deepEqual(reads.sort(), [GDELT_BULK_STATE_KEY, GDELT_INTEL_KEY].sort());
+    assert.deepEqual(reads.sort(), [GDELT_BULK_STATE_KEY, GDELT_INTEL_KEY, GDELT_BULK_COUNTRY_ARTICLES_KEY].sort());
     assert.deepEqual(result._state.cursor, {
       gkg: '20260730120000',
       export: '20260730120000',
@@ -364,6 +370,38 @@ describe('seed-gdelt-bulk-materializer fetch integration', () => {
       ['gdelt-event-event-1', 'gdelt-event-prior'],
     );
     assert.equal(result.topics.find((topic) => topic.id === 'military').articles.length, 1);
+  });
+
+  it('reads the previous per-country index from its own key and merges the cohort into it (#7748)', async () => {
+    const previousIndex = {
+      byCountry: {
+        NR: [{ title: 'Nauru budget passes', url: 'https://example.com/nauru-budget', source: 'example.com', date: '20260729T120000Z', tone: 0, primary: true, countryCount: 1 }],
+      },
+      fetchedAt: '2026-07-30T11:50:00.000Z',
+    };
+    const gkg = Array.from({ length: 27 }, () => '');
+    gkg[0] = 'gkg-palau';
+    gkg[1] = '20260730120000';
+    gkg[3] = 'islandtimes.example';
+    gkg[4] = 'https://islandtimes.example/palau-pact';
+    gkg[8] = 'MILITARY,1';
+    gkg[9] = '1#Palau#PS##7.5#134.5#1';
+    gkg[15] = '1.5,1,2,3';
+    gkg[26] = '<PAGE_TITLE>Palau signs maritime pact</PAGE_TITLE>';
+    const result = await fetchMaterializedGdelt({
+      _now: () => Date.parse('2026-07-30T12:05:00Z'),
+      _readSnapshot: async (key) => (key === GDELT_BULK_COUNTRY_ARTICLES_KEY ? previousIndex : null),
+      _fetchFiles: async () => [
+        { descriptor: { kind: 'gkg', timestamp: '20260730120000' }, csv: gkg.join('\t') },
+        { descriptor: { kind: 'export', timestamp: '20260730120000' }, csv: exportRow({}) },
+      ],
+    });
+    assert.deepEqual(Object.keys(result._countryIndex.byCountry).sort(), ['NR', 'PW']);
+    assert.equal(result._countryIndex.byCountry.PW[0].url, 'https://islandtimes.example/palau-pact');
+    assert.equal(result._countryIndex.byCountry.NR[0].url, 'https://example.com/nauru-budget');
+    assert.equal(result._countryIndex.fetchedAt, '2026-07-30T12:05:00.000Z');
+    assert.equal(result._state.countryIndex, undefined, 'the index never rides in the state key');
+    assert.equal(RUN_SEED_OPTS.publishTransform(result).countryIndex, undefined, 'the canonical intel key keeps its shape');
   });
 
   it('fails closed unless both feeds are current and GKG has usable records', async () => {
@@ -643,6 +681,7 @@ describe('seed-gdelt-bulk-materializer publication cohort', () => {
       GDELT_BULK_CONFLICT_KEY,
       GDELT_BULK_UNREST_KEY,
       GDELT_BULK_ARTICLES_KEY,
+      GDELT_BULK_COUNTRY_ARTICLES_KEY,
       POSITIVE_EVENTS_RPC_KEY,
       POSITIVE_EVENTS_BOOTSTRAP_KEY,
       GDELT_BULK_STATE_KEY,
@@ -650,6 +689,12 @@ describe('seed-gdelt-bulk-materializer publication cohort', () => {
       assert.ok(writes.some((write) => write.key === key), `missing write for ${key}`);
     }
     assert.equal(writes.at(-1).key, GDELT_BULK_STATE_KEY);
+    const countryIndexWrite = writes.find(({ key }) => key === GDELT_BULK_COUNTRY_ARTICLES_KEY);
+    assert.equal(countryIndexWrite.type, 'meta', 'the per-country index publishes with its own seed-meta record (#7748)');
+    assert.deepEqual(countryIndexWrite.args[1], data._countryIndex);
+    assert.equal(countryIndexWrite.args[2], 2 * 86_400);
+    assert.equal(countryIndexWrite.args[3], 1, 'recordCount is the row total across countries');
+    assert.equal(countryIndexWrite.args[4], COUNTRY_ARTICLES_META_KEY);
     assert.equal(
       writes.find(({ key }) => key === POSITIVE_EVENTS_RPC_KEY).type,
       'meta',
@@ -664,6 +709,34 @@ describe('seed-gdelt-bulk-materializer publication cohort', () => {
     );
   });
 
+  it('activates the country-index probe only after its own publish lands (#7748)', async () => {
+    const data = publicationData();
+    let marked = 0;
+    await afterPublish(data, undefined, {
+      _writeExtraKey: async () => undefined,
+      _writeExtraKeyWithMeta: async () => true,
+      _writeActivationMarker: async () => { marked += 1; },
+    });
+    assert.equal(marked, 1, 'a successful index publish writes the durable marker once');
+
+    marked = 0;
+    const outcome = await afterPublish(data, undefined, {
+      _writeExtraKey: async () => undefined,
+      _writeExtraKeyWithMeta: async (key) => (key === GDELT_BULK_COUNTRY_ARTICLES_KEY ? false : true),
+      _writeActivationMarker: async () => { marked += 1; },
+    });
+    assert.equal(marked, 0, 'a rejected index metadata write must not activate the probe');
+    assert.equal(outcome.completionState, 'DEGRADED');
+
+    marked = 0;
+    await afterPublish(data, undefined, {
+      _writeExtraKey: async (key) => { if (key === GDELT_BULK_UNREST_KEY) throw new Error('unrest down'); },
+      _writeExtraKeyWithMeta: async () => true,
+      _writeActivationMarker: async () => { marked += 1; },
+    });
+    assert.equal(marked, 1, 'a failed sibling write does not hold the index probe pending');
+  });
+
   it('preserves every derived key with its configured freshness TTL', () => {
     const expected = [
       ...TOPICS.flatMap((topic) => [
@@ -673,6 +746,8 @@ describe('seed-gdelt-bulk-materializer publication cohort', () => {
       { key: GDELT_BULK_CONFLICT_KEY, ttlSeconds: 6 * 60 * 60 },
       { key: GDELT_BULK_UNREST_KEY, ttlSeconds: 4.5 * 60 * 60 },
       { key: GDELT_BULK_ARTICLES_KEY, ttlSeconds: 2 * 86_400 },
+      { key: GDELT_BULK_COUNTRY_ARTICLES_KEY, ttlSeconds: 2 * 86_400 },
+      { key: COUNTRY_ARTICLES_META_KEY, ttlSeconds: 7 * 86_400 },
       { key: POSITIVE_EVENTS_RPC_KEY, ttlSeconds: 3 * 60 * 60 },
       { key: POSITIVE_EVENTS_BOOTSTRAP_KEY, ttlSeconds: 3 * 60 * 60 },
       { key: 'seed-meta:positive-events:geo', ttlSeconds: 7 * 86_400 },
@@ -802,6 +877,34 @@ describe('gdelt materializer freshness constants stay in lockstep (#5864)', () =
       `seed-health intervalMin ${intervalMin} (alerts at ${intervalMin * 2}min) must track`
       + ` the ${maxStaleMin}min health budget, not the retired 4h cron`,
     );
+  });
+
+  it('registers the per-country index as a standalone health dataset at the materializer budget (#7748)', () => {
+    // No dashboard consumer reads the index, so it is a STANDALONE health key
+    // (AGENTS.md) with its own seed-meta record; the gate must track the same
+    // 15-minute tick as gdeltIntel, and the 2-day data TTL must outlive it.
+    const healthSrc = read('../api/health.js');
+    assert.match(healthSrc, /gdeltCountryArticles:\s*'gdelt:bulk:country-articles:v1'/, 'STANDALONE_KEYS must carry the index');
+    const gate = healthSrc.match(/gdeltCountryArticles:\s*\{\s*key:\s*'seed-meta:gdelt:bulk:country-articles',\s*maxStaleMin:\s*(\d+)/);
+    assert.ok(gate, 'api/health.js must gate the index on its seed-meta key');
+    assert.equal(Number(gate[1]), RUN_SEED_OPTS.maxStaleMin);
+    // Deploy-order softening: pending until the marker the seeder writes
+    // exists, strict afterwards — the same one-way marker the health check
+    // lists, so the seeder and the probe cannot name different keys.
+    assert.equal(COUNTRY_ARTICLES_ACTIVATION_KEY, 'seed-activated:gdelt:bulk:country-articles');
+    assert.match(healthSrc, /gdeltCountryArticles:\s*\{[^}]*activationKey:\s*'seed-activated:gdelt:bulk:country-articles'[^}]*cutover:\s*\{\s*mode:\s*'activation-marker'/);
+    assert.match(healthSrc, /gdeltCountryArticles:\s*SEED_META\.gdeltCountryArticles\.activationKey/, 'ACTIVATION_MARKERS must list the probe');
+    const seedHealth = read('../api/seed-health.js').match(/'gdelt:bulk:country-articles':\s*\{ key: 'seed-meta:gdelt:bulk:country-articles',\s*intervalMin:\s*(\d+)/);
+    assert.ok(seedHealth, 'api/seed-health.js must track the index');
+    const intervalMin = Number(seedHealth[1]);
+    assert.ok(intervalMin * 2 >= RUN_SEED_OPTS.maxStaleMin && intervalMin * 2 <= RUN_SEED_OPTS.maxStaleMin + 15);
+    const ttlByKey = new Map(RUN_SEED_OPTS.preserveKeyTtls.map(({ key, ttlSeconds }) => [key, ttlSeconds]));
+    assert.ok(ttlByKey.get(GDELT_BULK_COUNTRY_ARTICLES_KEY) > Number(gate[1]) * 60, 'the index TTL must outlive its health gate');
+    assert.ok(ttlByKey.get(COUNTRY_ARTICLES_META_KEY) >= ttlByKey.get(GDELT_BULK_COUNTRY_ARTICLES_KEY), 'the seed-meta record must not expire before the data');
+    assert.equal(COUNTRY_ARTICLES_META_KEY, 'seed-meta:gdelt:bulk:country-articles');
+    assert.equal(countryIndexRecordCount({ byCountry: { PW: [{}, {}], NR: [{}] } }), 3);
+    assert.equal(countryIndexRecordCount({ byCountry: { PW: 'malformed' } }), 0);
+    assert.equal(countryIndexRecordCount(null), 0);
   });
 
   it('every published product outlives the staleness budget that gates it', () => {

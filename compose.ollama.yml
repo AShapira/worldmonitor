@@ -34,6 +34,9 @@ services:
 
   ais-relay:
     environment:
+      # Host seeders use 127.0.0.1:3000 in .env; the relay must reach the
+      # application through container DNS, never its own loopback address.
+      API_BASE_URL: "http://worldmonitor:8080"
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?RELAY_SHARED_SECRET required}"
       WORLDMONITOR_RELAY_KEY: "${WORLDMONITOR_RELAY_KEY:?WORLDMONITOR_RELAY_KEY required}"
       OLLAMA_API_URL: "http://ollama:11434"

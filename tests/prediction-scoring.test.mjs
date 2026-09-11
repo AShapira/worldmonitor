@@ -7,6 +7,7 @@ import {
   tagRegions,
   parseYesPrice,
   parseKalshiYesPrice,
+  parsePredictionMarketVolume,
   selectPricedKalshiMarket,
   shouldInclude,
   scoreMarket,
@@ -121,6 +122,18 @@ describe('parseYesPrice', () => {
 
   it('rounds to one decimal place', () => {
     assert.equal(parseYesPrice({ outcomePrices: '["0.333"]' }), 33.3);
+  });
+});
+
+describe('parsePredictionMarketVolume', () => {
+  it('prefers contract volumeNum over the alternate volume field', () => {
+    assert.equal(parsePredictionMarketVolume({ volumeNum: 12_345, volume: '99999' }), 12_345);
+  });
+
+  it('parses contract volume strings and rejects missing or invalid values', () => {
+    assert.equal(parsePredictionMarketVolume({ volume: '6789.5' }), 6789.5);
+    assert.equal(parsePredictionMarketVolume({}), 0);
+    assert.equal(parsePredictionMarketVolume({ volumeNum: Number.NaN }), 0);
   });
 });
 
@@ -316,6 +329,12 @@ describe('isExpired', () => {
   it('returns false for invalid date string', () => {
     assert.ok(!isExpired('not-a-date'));
   });
+
+  it('evaluates expiry against an injected clock', () => {
+    const endDate = '2026-08-05T00:00:00Z';
+    assert.ok(!isExpired(endDate, Date.parse('2026-08-04T00:00:00Z')));
+    assert.ok(isExpired(endDate, Date.parse('2026-08-05T00:00:00.001Z')));
+  });
 });
 
 describe('filterAndScore', () => {
@@ -338,6 +357,21 @@ describe('filterAndScore', () => {
     const result = filterAndScore(candidates, null);
     assert.equal(result.length, 1);
     assert.equal(result[0].title, 'ECB rate decision');
+  });
+
+  it('uses the injected clock when filtering static fixtures', () => {
+    const candidate = market('RBI policy decision', 50, 50000, {
+      endDate: '2026-08-05T00:00:00Z',
+    });
+
+    assert.equal(
+      filterAndScore([candidate], null, 25, Date.parse('2026-08-04T00:00:00Z')).length,
+      1,
+    );
+    assert.equal(
+      filterAndScore([candidate], null, 25, Date.parse('2026-08-05T00:00:00.001Z')).length,
+      0,
+    );
   });
 
   it('applies tag filter', () => {

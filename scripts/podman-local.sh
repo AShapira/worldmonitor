@@ -73,6 +73,7 @@ init_env() {
   append_env RELAY_SHARED_SECRET "$(openssl rand -hex 32)"
   append_env REDIS_PASSWORD "$(openssl rand -hex 32)"
   append_env REDIS_TOKEN "$(openssl rand -hex 32)"
+  append_env WM_SESSION_SECRET "$(openssl rand -hex 32)"
   append_env WORLDMONITOR_API_KEY "wm_local_$(openssl rand -hex 32)"
   append_env WORLDMONITOR_VALID_KEYS "$(env_value WORLDMONITOR_API_KEY)"
   # Host-run warmers use this dedicated name when authenticating back to the
@@ -243,16 +244,16 @@ case "${command_name}" in
     init_env
     ;;
   config)
-    [[ -f "${ENV_FILE}" ]] || init_env
+    init_env
     compose config >/dev/null
     printf 'Merged Compose configuration is valid.\n'
     ;;
   build)
-    [[ -f "${ENV_FILE}" ]] || init_env
+    init_env
     compose build
     ;;
   up)
-    [[ -f "${ENV_FILE}" ]] || init_env
+    init_env
     compose_up
     ;;
   deploy)
@@ -271,6 +272,8 @@ case "${command_name}" in
     # podman-compose restarts services in dependency-hostile order and can try
     # to start the relay while Redis/Ollama are still stopped. A down/up cycle
     # preserves named volumes and recreates the dependency graph cleanly.
+    init_env
+    compose config >/dev/null
     compose down
     compose_up
     ;;

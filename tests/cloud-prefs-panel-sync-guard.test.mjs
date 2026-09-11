@@ -93,8 +93,8 @@ describe('cloud prefs panel sync guardrails', () => {
     const cloudApplyBlock = appSrc.slice(cloudApplyStart, cloudApplyEnd);
     assert.match(
       cloudApplyBlock,
-      /const reconciledPanelSettings = this\.enforceFreeTierLimits\(cloudSyncVersion\);/,
-      'cloud panel snapshots must re-run entitlement reconciliation',
+      /const reconciledPanelSettings = tierReconciliationDeferred\s*\? false\s*: this\.enforceFreeTierLimits\(cloudSyncVersion\);/,
+      'cloud panel snapshots must reconcile only after account preference handoff',
     );
     assert.match(
       cloudApplyBlock,
@@ -107,8 +107,8 @@ describe('cloud prefs panel sync guardrails', () => {
     );
     assert.match(
       cloudApplyHandler,
-      /if \(!freeTierLimitsInvoked\) this\.enforceFreeTierLimits\(cloudSyncVersion\);[\s\S]*?this\.state\.disabledSources = new Set\(loadFromStorage<string\[\]>\(STORAGE_KEYS\.disabledFeeds, \[\]\)\);/,
-      'a disabled-feeds-only cloud generation must re-run the free source cap and then reload the enforced state',
+      /if \(!tierReconciliationDeferred && !freeTierLimitsInvoked\) \{\s*this\.enforceFreeTierLimits\(cloudSyncVersion\);\s*\}[\s\S]*?this\.state\.disabledSources = new Set\(loadFromStorage<string\[\]>\(STORAGE_KEYS\.disabledFeeds, \[\]\)\);/,
+      'a disabled-feeds-only cloud generation must defer during handoff or re-run the cap before reloading state',
     );
     // The legacy sweep must stay one-shot per browser: it cannot tell pre-marker
     // gate damage from a deliberate hide, so re-arming it on cloud snapshots
@@ -123,6 +123,16 @@ describe('cloud prefs panel sync guardrails', () => {
       appSrc,
       /monitorPanel\?\.setMonitors\(this\.state\.monitors\)/,
       'App must update an already-mounted My Monitors panel when cloud prefs change monitors',
+    );
+    assert.match(
+      cloudApplyHandler,
+      /void applyVisibleMapDimension\(this\.state, mode === 'globe' \? '3d' : '2d'\)/,
+      'cloud map-mode changes must reconcile renderer, application layer state, and persistence through the visible control path',
+    );
+    assert.doesNotMatch(
+      cloudApplyHandler,
+      /this\.state\.map\?\.switchTo(?:Globe|Flat)\(\)/,
+      'cloud map-mode changes must not bypass application layer-state reconciliation',
     );
     assert.match(
       appSrc,
@@ -144,7 +154,7 @@ describe('cloud prefs panel sync guardrails', () => {
   it('reapplies delayed free-tier panel clamps to the mounted dashboard', () => {
     const appSrc = readSrc('src/App.ts');
     const clampStart = appSrc.indexOf('if (panelsChanged) {');
-    const clampEnd = appSrc.indexOf('// --- Source limit ---', clampStart);
+    const clampEnd = appSrc.indexOf('this.reconcileSourceLimitForTier(false);', clampStart);
     assert.ok(clampStart >= 0 && clampEnd > clampStart, 'free-tier panel clamp block must exist');
     const clampBlock = appSrc.slice(clampStart, clampEnd);
 
@@ -162,15 +172,20 @@ describe('cloud prefs panel sync guardrails', () => {
 
   it('updates the live disabled-source set when a delayed cap persists changes', () => {
     const appSrc = readSrc('src/App.ts');
-    const capStart = appSrc.indexOf('if (totalEligible > FREE_MAX_SOURCES) {');
-    const capEnd = appSrc.indexOf('return panelsChanged;', capStart);
-    assert.ok(capStart >= 0 && capEnd > capStart, 'free-tier source-cap block must exist');
+    const capStart = appSrc.indexOf('private reconcileSourceLimitForTier(');
+    const capEnd = appSrc.indexOf('/**\n   * Enforce free-tier panel', capStart);
+    assert.ok(capStart >= 0 && capEnd > capStart, 'owned free-tier source-cap helper must exist');
     const capBlock = appSrc.slice(capStart, capEnd);
 
     assert.match(
       capBlock,
-      /saveToStorage\(STORAGE_KEYS\.disabledFeeds, Array\.from\(disabledSources\)\);\s*this\.state\.disabledSources = new Set\(disabledSources\);/,
+      /persistJsonStorageValue\(STORAGE_KEYS\.disabledFeeds, \[\.\.\.nextDisabled\]\)[\s\S]*?if \(disabledChanged\) \{[\s\S]*?this\.state\.disabledSources = new Set\(nextDisabled\);/,
       'a cap reached from delayed auth or entitlement settlement must update the running app state',
+    );
+    assert.match(
+      capBlock,
+      /persistJsonStorageValue\(\s*STORAGE_KEYS\.sourceGateOwnership,\s*\[\.\.\.nextGateOwned\],\s*\)/,
+      'the source cap must explicitly confirm persisted ownership',
     );
   });
 
@@ -253,12 +268,21 @@ describe('cloud prefs panel sync guardrails', () => {
     );
     assert.match(
       cloudSyncSrc,
-      /if \(changed\) persistDirtyKeys\(\);/,
-      'successful uploads must clear only the dirty keys that actually settled',
+      /function markDirtyKey\(key: CloudSyncKey\): void \{\s*_dirtyKeys\.add\(key\);\s*persistDirtyKeyAddition\(key\);\s*\}/,
+      'marking a key dirty must union into the persisted set so concurrent same-user tabs cannot clobber each other (#4746)',
     );
     assert.match(
       cloudSyncSrc,
-      /if \(_dirtyKeys\.size === 0\) \{[\s\S]*Storage\.prototype\.removeItem\.call\(localStorage, KEY_DIRTY_KEYS\);[\s\S]*return;[\s\S]*\}[\s\S]*if \(!_dirtyKeysUserId\) return;/,
+      /if \(settled\.length > 0\) persistSettledDirtyKeyRemovals\(settled\);/,
+      'successful uploads must clear only the dirty keys that actually settled, by targeted removal — never a wholesale overwrite (#4746)',
+    );
+    assert.match(
+      cloudSyncSrc,
+      // Accessor-agnostic on purpose: #7833 moved this module onto
+      // safeStorageRemove, and pinning a spelling just re-breaks on the next
+      // migration. What this pins is the ORDER — the empty-set delete has to
+      // happen before the ownerless bail.
+      /if \(_dirtyKeys\.size === 0\) \{[\s\S]*(?:safeStorageRemove|rawRemove|Storage\.prototype\.removeItem\.call)\([^)]*KEY_DIRTY_KEYS[^)]*\);[\s\S]*return;[\s\S]*\}[\s\S]*if \(!_dirtyKeysUserId\) return;/,
       'ownerless dirty writes before sign-in must not delete the previous persisted dirty-key marker',
     );
     assert.match(

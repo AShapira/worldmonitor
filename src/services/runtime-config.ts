@@ -1,4 +1,5 @@
 import { isDesktopRuntime } from './runtime';
+import { safeStorageSet } from '@/utils/safe-storage';
 import { invokeTauri } from './tauri-bridge';
 
 export type RuntimeSecretKey =
@@ -240,7 +241,7 @@ export const RUNTIME_FEATURES: RuntimeFeatureDefinition[] = [
   {
     id: 'finnhubMarkets',
     name: 'Finnhub market data',
-    description: 'Real-time stock quotes and market data from Finnhub.',
+    description: 'Delayed or seeded stock quotes via Finnhub when configured. A key is not a live tape.',
     requiredSecrets: ['FINNHUB_API_KEY'],
     fallback: 'Stock ticker uses limited free data.',
   },
@@ -363,12 +364,21 @@ if (!isDesktopRuntime()) secretsReadyResolve();
 
 const listeners = new Set<() => void>();
 
+function isLocalOperatorMode(): boolean {
+  try {
+    return Boolean(import.meta.env.VITE_LOCAL_OPERATOR_MODE === '1');
+  } catch {
+    // sentry-coverage-ok: Node consumers have no Vite env; operator mode defaults off.
+    return false;
+  }
+}
+
 const runtimeConfig: RuntimeConfig = {
   featureToggles: readStoredToggles(),
   // The Docker deployment keeps the operator key in nginx and injects it
   // server-side. Expose presence only so local premium panels unlock without
   // placing the key in the Vite bundle or renderer memory.
-  secrets: import.meta.env.VITE_LOCAL_OPERATOR_MODE === '1'
+  secrets: isLocalOperatorMode()
     ? { WORLDMONITOR_API_KEY: { source: 'vault' } }
     : {},
 };
@@ -454,7 +464,7 @@ export function getEffectiveSecrets(feature: RuntimeFeatureDefinition): RuntimeS
 
 export function setFeatureToggle(featureId: RuntimeFeatureId, enabled: boolean): void {
   runtimeConfig.featureToggles[featureId] = enabled;
-  localStorage.setItem(TOGGLES_STORAGE_KEY, JSON.stringify(runtimeConfig.featureToggles));
+  safeStorageSet(TOGGLES_STORAGE_KEY, JSON.stringify(runtimeConfig.featureToggles));
   notifyConfigChanged();
 }
 

@@ -21,11 +21,16 @@
 import { readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { eq, serialize } from './lib/openapi-codegen.mjs';
+import { eq, serialize, readIdempotencyExemptPaths } from './lib/openapi-codegen.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const apiDir = resolve(root, 'docs/api');
 const CHECK = process.argv.includes('--check');
+// Read from the runtime's own Set (server/_shared/idempotency.ts) rather than restating
+// it here: the gateway skips the idempotency machinery for these paths, and the spec must
+// describe that same behaviour. A second literal would let the docs and the runtime drift
+// silently in either direction.
+const IDEMPOTENCY_EXEMPT_PATHS = readIdempotencyExemptPaths();
 
 const DESCRIPTION =
   'Optional client-generated idempotency key. Retrying a POST with the same key and an identical request body replays the original response (only the status, body, and Content-Type are reproduced) instead of re-executing; reusing the key with a different body is rejected with 422. For mutations this avoids duplicating the side effect, while for batch-read POSTs it replays a cached snapshot that can be up to 24 hours stale. Keys are scoped per authenticated caller (falling back to the source IP for unauthenticated endpoints) and retained for 24 hours.';
@@ -162,9 +167,10 @@ function canonicalizeJson400Response(existing) {
 
 function injectJson(spec) {
   let changed = false;
-  for (const ops of Object.values(spec.paths ?? {})) {
+  for (const [pathname, ops] of Object.entries(spec.paths ?? {})) {
     const post = ops && typeof ops === 'object' ? ops.post : null;
     if (!post || typeof post !== 'object') continue;
+    if (IDEMPOTENCY_EXEMPT_PATHS.has(pathname)) continue;
     const params = Array.isArray(post.parameters) ? post.parameters : [];
     const paramIndex = params.findIndex(isIdempotencyParam);
     if (paramIndex === -1) {
@@ -311,14 +317,22 @@ function findIndentedBlockEnd(lines, start, end, markerRegex, parentRegex) {
   return blockEnd;
 }
 
+// Every ensureYaml* helper below returns { delta, replaced }: the line-count
+// shift AND, separately, whether it actually rewrote anything. The two are not
+// interchangeable — an equal-line-count rewrite (a reworded description of the
+// same length) shifts nothing but IS a change, so a caller inferring "changed"
+// from `delta !== 0` would leave the file unwritten and report --check green.
 function replaceLinesIfDifferent(lines, start, blockEnd, replacement) {
   const current = lines.slice(start, blockEnd);
   if (current.length === replacement.length && current.every((line, idx) => line === replacement[idx])) {
-    return 0;
+    return { delta: 0, replaced: false };
   }
   lines.splice(start, blockEnd - start, ...replacement);
-  return replacement.length - (blockEnd - start);
+  return { delta: replacement.length - (blockEnd - start), replaced: true };
 }
+
+const spliced = (delta) => ({ delta, replaced: true });
+const unchanged = { delta: 0, replaced: false };
 
 function ensureYamlIdempotencyParam(lines, postIndex, end) {
   let paramsIndex = -1;
@@ -344,11 +358,11 @@ function ensureYamlIdempotencyParam(lines, postIndex, end) {
 
   if (paramsIndex !== -1) {
     lines.splice(paramsIndex + 1, 0, ...YAML_ITEM);
-    return YAML_ITEM.length;
+    return spliced(YAML_ITEM.length);
   }
 
   lines.splice(postIndex + 1, 0, '            parameters:', ...YAML_ITEM);
-  return 1 + YAML_ITEM.length;
+  return spliced(1 + YAML_ITEM.length);
 }
 
 function yamlResponseCodeRegex(code) {
@@ -385,7 +399,7 @@ function ensureYamlResponse(lines, responsesIndex, end, code, replacement, previ
     }
   }
   lines.splice(insertAt, 0, ...replacement);
-  return replacement.length;
+  return spliced(replacement.length);
 }
 
 function yaml400HasIdempotencyContract(lines, start, blockEnd) {
@@ -410,12 +424,12 @@ function ensureYaml400Response(lines, responsesIndex, end) {
       /^ {16}"(?:[0-9]{3}|default)":/,
       /^ {0,12}\S/,
     );
-    if (yaml400HasIdempotencyContract(lines, j, blockEnd)) return 0;
+    if (yaml400HasIdempotencyContract(lines, j, blockEnd)) return unchanged;
     return replaceLinesIfDifferent(lines, j, blockEnd, YAML_400_RESPONSE);
   }
 
   lines.splice(responsesIndex + 1, 0, ...YAML_400_RESPONSE);
-  return YAML_400_RESPONSE.length;
+  return spliced(YAML_400_RESPONSE.length);
 }
 
 // Insert (or refresh) the replay-marker `headers:` block inside the existing
@@ -430,7 +444,7 @@ function ensureYamlSuccessHeaders(lines, responsesIndex, end) {
       break;
     }
   }
-  if (blockStart === -1) return 0;
+  if (blockStart === -1) return unchanged;
 
   const blockEnd = findIndentedBlockEnd(
     lines,
@@ -455,7 +469,7 @@ function ensureYamlSuccessHeaders(lines, responsesIndex, end) {
     }
   }
   lines.splice(insertAt, 0, ...YAML_SUCCESS_HEADERS);
-  return YAML_SUCCESS_HEADERS.length;
+  return spliced(YAML_SUCCESS_HEADERS.length);
 }
 
 function injectYaml(text) {
@@ -474,17 +488,18 @@ function injectYaml(text) {
       continue;
     }
     if (!currentPath || !/^ {8}post:\s*$/.test(line)) continue;
+    if (IDEMPOTENCY_EXEMPT_PATHS.has(currentPath)) continue;
 
     // Op block spans until the next line at <= 8-space indent (next method /
     // path / top-level key).
     let end = i + 1;
     while (end < lines.length && !/^ {0,8}\S/.test(lines[end])) end++;
 
-    let delta = ensureYamlIdempotencyParam(lines, i, end);
-    if (delta !== 0) {
-      changed = true;
-      end += delta;
-    }
+    // `replaced` drives `changed`, `delta` drives the end bound — never infer
+    // one from the other (see replaceLinesIfDifferent).
+    let result = ensureYamlIdempotencyParam(lines, i, end);
+    if (result.replaced) changed = true;
+    end += result.delta;
 
     let responsesIndex = -1;
     for (let j = i + 1; j < end; j++) {
@@ -494,25 +509,19 @@ function injectYaml(text) {
       }
     }
     if (responsesIndex !== -1) {
-      delta = ensureYamlSuccessHeaders(lines, responsesIndex, end);
-      if (delta !== 0) {
-        changed = true;
-        end += delta;
-      }
-      delta = ensureYaml400Response(lines, responsesIndex, end);
-      if (delta !== 0) {
-        changed = true;
-        end += delta;
-      }
+      result = ensureYamlSuccessHeaders(lines, responsesIndex, end);
+      if (result.replaced) changed = true;
+      end += result.delta;
+      result = ensureYaml400Response(lines, responsesIndex, end);
+      if (result.replaced) changed = true;
+      end += result.delta;
       for (const [code, replacement, previousCode] of [
         ['409', YAML_409_RESPONSE, '400'],
         ['422', YAML_422_RESPONSE, '409'],
       ]) {
-        delta = ensureYamlResponse(lines, responsesIndex, end, code, replacement, previousCode);
-        if (delta !== 0) {
-          changed = true;
-          end += delta;
-        }
+        result = ensureYamlResponse(lines, responsesIndex, end, code, replacement, previousCode);
+        if (result.replaced) changed = true;
+        end += result.delta;
       }
     }
     i = end - 1;

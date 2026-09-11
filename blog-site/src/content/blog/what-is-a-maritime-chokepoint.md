@@ -1,12 +1,12 @@
 ---
 title: "What Is a Maritime Chokepoint?"
-description: "Learn what maritime chokepoints are, how WorldMonitor tracks 13 waterways, and how to interpret live flow estimates, disruptions, and status scores."
+description: "Learn what maritime chokepoints are, how WorldMonitor tracks its waterway registry, and how to interpret live flow estimates, disruptions, and status scores."
 metaTitle: "What Is a Maritime Chokepoint? | WorldMonitor"
 keywords: "maritime chokepoint, shipping chokepoint, Strait of Hormuz, Suez Canal, supply chain risk, chokepoint monitoring"
 audience: "Logistics teams, maritime analysts, commodity traders, students, geopolitical risk readers"
 heroImage: "/blog/images/blog/what-is-a-maritime-chokepoint.jpg"
 pubDate: "2026-06-13"
-modifiedDate: "2026-07-22"
+modifiedDate: "2026-09-04"
 ---
 
 A maritime chokepoint is a narrow passage where a large share of global trade, energy, food, or military movement must pass through a small physical space.
@@ -35,9 +35,9 @@ Chokepoints matter for five reasons:
 
 A chokepoint does not need to close completely to matter. A credible threat, navigation warning, or traffic anomaly can be enough to change routing and pricing.
 
-## The 13 monitored waterways
+## The monitored-waterway registry
 
-WorldMonitor's canonical chokepoint registry currently monitors 13 waterways:
+WorldMonitor's canonical chokepoint registry includes:
 
 | Canonical id | Public name |
 |---|---|
@@ -68,9 +68,11 @@ The public status badge is a traffic-light score: green, yellow, or red. It is n
 The disruption score combines:
 
 - a baseline geopolitical threat weight
-- active navigational warnings
-- AIS disruption severity
-- a transit anomaly bonus when traffic drops sharply under high-threat conditions
+- active NGA navigational warnings
+- AIS congestion severity
+- a transit anomaly bonus when PortWatch daily transits drop sharply under high-threat conditions
+
+Nothing else moves the number. AIS event counts, relay transit counts, and PortWatch week-over-week movement are published as context rather than score inputs. PortWatch supplies both: the anomaly bonus compares its daily transit history, seven days against the prior thirty, while the week-over-week figure on the page is presentation only.
 
 The score is capped at 100. Green is below 20, yellow is 20 to 49, and red is 50 or higher.
 
@@ -111,7 +113,7 @@ For independently published baselines and current definitions, see the U.S. Ener
 
 No. Red means the combined disruption score is high. It can reflect military threat, active warnings, AIS disruption, anomaly signals, or several of those at once.
 
-**Why do only seven waterways have live flow estimates?**
+**Why do only some waterways have live flow estimates?**
 
 Because those seven have EIA baseline IDs in the current energy-flow seeder. The other canonical waterways can still have status and risk context without publishing an oil/gas flow estimate.
 

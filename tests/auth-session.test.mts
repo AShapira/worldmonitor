@@ -23,6 +23,7 @@ import assert from 'node:assert/strict';
 import { createServer, type Server } from 'node:http';
 import { describe, it, before, after } from 'node:test';
 import { generateKeyPair, exportJWK, jwtVerify, SignJWT } from 'jose';
+import { userPrefsOptionsHttpHandler } from '../convex/http.ts';
 
 const EXPECTED_CLOCK_TOLERANCE_SECONDS = 5;
 
@@ -42,10 +43,12 @@ type AuthSessionResult = {
 delete process.env.CLERK_JWT_ISSUER_DOMAIN;
 
 let validateBearerTokenNoEnv: (token: string) => Promise<AuthSessionResult>;
+let lookupClerkPlanNoEnv: (userId: string) => Promise<'free' | 'pro' | 'unavailable'>;
 
 before(async () => {
   const mod = await import('../server/auth-session.ts');
   validateBearerTokenNoEnv = mod.validateBearerToken;
+  lookupClerkPlanNoEnv = mod.lookupClerkPlan;
 });
 
 describe('validateBearerToken (no CLERK_JWT_ISSUER_DOMAIN)', () => {
@@ -67,6 +70,47 @@ describe('validateBearerToken (no CLERK_JWT_ISSUER_DOMAIN)', () => {
     if (!result.valid) {
       assert.equal(result.userId, undefined);
       assert.equal(result.role, undefined);
+    }
+  });
+
+  it('reports an unavailable plan lookup when Clerk server credentials are absent', async () => {
+    assert.equal(await lookupClerkPlanNoEnv('user_missing_config'), 'unavailable');
+  });
+});
+
+describe('lookupClerkPlan', () => {
+  it('distinguishes verified roles, missing users, and backend outages', async () => {
+    const originalSecret = process.env.CLERK_SECRET_KEY;
+    const originalFetch = globalThis.fetch;
+    const originalWarn = console.warn;
+    process.env.CLERK_SECRET_KEY = 'sk_test_embed_lookup';
+    console.warn = () => {};
+
+    try {
+      const mod = await import(`../server/auth-session.ts?plan-lookup=${Date.now()}`);
+      let response = new Response(JSON.stringify({ public_metadata: { plan: 'pro' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      globalThis.fetch = async () => response;
+      assert.equal(await mod.lookupClerkPlan('user_role_pro'), 'pro');
+
+      response = new Response(JSON.stringify({ public_metadata: { plan: 'free' } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      assert.equal(await mod.lookupClerkPlan('user_role_free'), 'free');
+
+      response = new Response('', { status: 404 });
+      assert.equal(await mod.lookupClerkPlan('user_missing'), 'free');
+
+      response = new Response('', { status: 503 });
+      assert.equal(await mod.lookupClerkPlan('user_backend_down'), 'unavailable');
+    } finally {
+      globalThis.fetch = originalFetch;
+      console.warn = originalWarn;
+      if (originalSecret === undefined) delete process.env.CLERK_SECRET_KEY;
+      else process.env.CLERK_SECRET_KEY = originalSecret;
     }
   });
 });
@@ -568,50 +612,41 @@ describe('validateBearerToken (with JWKS)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Suite 3: CORS origin matching -- pure logic (independent of auth provider)
+// Suite 3: Convex user-preferences CORS preflight
 // ---------------------------------------------------------------------------
 
-describe('CORS origin matching (convex/http.ts)', () => {
-  function matchOrigin(origin: string, pattern: string): boolean {
-    if (pattern.startsWith('*.')) {
-      return origin.endsWith(pattern.slice(1));
+describe('userPrefsOptionsHttpHandler CORS', () => {
+  const invokePreflight = (origin?: string) => userPrefsOptionsHttpHandler(
+    {} as Parameters<typeof userPrefsOptionsHttpHandler>[0],
+    new Request('https://convex.example/api/user-prefs', {
+      method: 'OPTIONS',
+      headers: origin ? { Origin: origin } : undefined,
+    }),
+  );
+
+  it('emits CORS headers for each trusted origin shape', async () => {
+    for (const origin of [
+      'https://worldmonitor.app',
+      'https://preview-xyz.worldmonitor.app',
+      'http://localhost:3000',
+    ]) {
+      const response = await invokePreflight(origin);
+      assert.equal(response.status, 204);
+      assert.equal(response.headers.get('access-control-allow-origin'), origin);
+      assert.equal(response.headers.get('access-control-allow-methods'), 'POST, OPTIONS');
     }
-    return origin === pattern;
-  }
-
-  function allowedOrigin(origin: string | null, trusted: string[]): string | null {
-    if (!origin) return null;
-    return trusted.some((p) => matchOrigin(origin, p)) ? origin : null;
-  }
-
-  const TRUSTED = [
-    'https://worldmonitor.app',
-    '*.worldmonitor.app',
-    'http://localhost:3000',
-  ];
-
-  it('allows exact match', () => {
-    assert.equal(allowedOrigin('https://worldmonitor.app', TRUSTED), 'https://worldmonitor.app');
   });
 
-  it('allows wildcard subdomain', () => {
-    const origin = 'https://preview-xyz.worldmonitor.app';
-    assert.equal(allowedOrigin(origin, TRUSTED), origin);
-  });
-
-  it('allows localhost', () => {
-    assert.equal(allowedOrigin('http://localhost:3000', TRUSTED), 'http://localhost:3000');
-  });
-
-  it('blocks unknown origin', () => {
-    assert.equal(allowedOrigin('https://evil.com', TRUSTED), null);
-  });
-
-  it('blocks partial domain match', () => {
-    assert.equal(allowedOrigin('https://attackerworldmonitor.app', TRUSTED), null);
-  });
-
-  it('returns null for null origin -- no ACAO header emitted', () => {
-    assert.equal(allowedOrigin(null, TRUSTED), null);
+  it('omits CORS headers for untrusted and absent origins', async () => {
+    for (const origin of [
+      'https://evil.com',
+      'https://attackerworldmonitor.app',
+      undefined,
+    ]) {
+      const response = await invokePreflight(origin);
+      assert.equal(response.status, 204);
+      assert.equal(response.headers.get('access-control-allow-origin'), null);
+      assert.equal(response.headers.get('access-control-allow-methods'), null);
+    }
   });
 });

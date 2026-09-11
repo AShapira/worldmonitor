@@ -17,16 +17,16 @@ import assert from 'node:assert/strict';
 // ---------------------------------------------------------------------------
 // Cyber domain helpers
 // ---------------------------------------------------------------------------
+import { clampInt, SEVERITY_RANK } from '../server/worldmonitor/cyber/v1/_shared.ts';
+// Deduplication and proto conversion live in the Railway seeder, which is the
+// only code that still runs them. The RPC reads what the seeder already wrote.
 import {
-  clampInt,
   dedupeThreats,
-  toProtoCyberThreat,
+  toProto as toProtoCyberThreat,
   THREAT_TYPE_MAP,
   SOURCE_MAP,
   SEVERITY_MAP,
-  SEVERITY_RANK,
-  type RawThreat,
-} from '../server/worldmonitor/cyber/v1/_shared.ts';
+} from '../scripts/seed-cyber-threats.mjs';
 
 // ---------------------------------------------------------------------------
 // Military / USNI fleet report helpers
@@ -42,6 +42,7 @@ import type { USNIFleetReport } from '../src/generated/server/worldmonitor/milit
 // ---------------------------------------------------------------------------
 import { deduplicateHeadlines } from '../server/worldmonitor/news/v1/dedup.mjs';
 import { buildArticlePrompts, hashString, selectUniqueHeadlinePairs } from '../server/worldmonitor/news/v1/_shared.ts';
+import { MAX_BODY_LEN } from '../src/utils/summary-cache-key.ts';
 
 // ---------------------------------------------------------------------------
 // Infrastructure / cable health helpers
@@ -157,7 +158,7 @@ describe('clampInt', () => {
 // ========================================================================
 
 describe('dedupeThreats', () => {
-  const baseThreat: RawThreat = {
+  const baseThreat = {
     id: 'feodo:1.2.3.4',
     type: 'c2_server',
     source: 'feodo',
@@ -220,7 +221,7 @@ describe('dedupeThreats', () => {
 // ========================================================================
 
 describe('toProtoCyberThreat', () => {
-  const raw: RawThreat = {
+  const raw = {
     id: 'feodo:1.2.3.4',
     type: 'c2_server',
     source: 'feodo',
@@ -471,12 +472,12 @@ describe('buildArticlePrompts', () => {
     assert.ok(result.userPrompt.includes('2. SpaceX launch delayed\n    Context: SpaceX postponed'));
   });
 
-  it('clips body to 400 chars at prompt-builder level', () => {
-    const longBody = 'B'.repeat(800);
+  it('clips body with the canonical cache-key limit at prompt-builder level', () => {
+    const longBody = 'B'.repeat(MAX_BODY_LEN * 2);
     const result = buildArticlePrompts(['H'], ['H'], { ...baseOpts, bodies: [longBody] });
     const match = result.userPrompt.match(/Context: (B+)/);
     assert.ok(match, 'Context: present');
-    assert.strictEqual(match[1].length, 400, 'body clipped to 400');
+    assert.strictEqual(match[1].length, MAX_BODY_LEN, 'prompt and cache identity share one body limit');
   });
 
   it('translate mode ignores bodies (safety: translate path is headline[0]-only)', () => {

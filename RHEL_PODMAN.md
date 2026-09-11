@@ -7,7 +7,7 @@ not expose them to a LAN without a TLS reverse proxy and authentication.
 ## Requirements
 
 - Podman with a working rootless user session
-- `podman-compose`, Node.js 22+, OpenSSL, curl, and jq
+- `podman-compose`, Node.js 24, OpenSSL, curl, and jq
 - NVIDIA Container Toolkit CDI device `nvidia.com/gpu=all`
 - An NVIDIA driver supported by Ollama
 
@@ -25,6 +25,8 @@ The launcher keeps host-side LLM URLs in the ignored `.env` file while
 `compose.ollama.yml` gives containers the internal `http://ollama:11434`
 address. Do not put LLM URLs in `docker-compose.override.yml`; the host seeder
 wrapper parses that file and container-only DNS names would break host runs.
+The relay similarly uses `http://worldmonitor:8080` inside the container while
+host seeders keep `API_BASE_URL=http://127.0.0.1:3000`.
 
 ```bash
 ./scripts/podman-local.sh deploy
@@ -32,6 +34,13 @@ wrapper parses that file and container-only DNS names would break host runs.
 systemctl --user start worldmonitor-podman.service
 systemctl --user start worldmonitor-seeders.timer
 ```
+
+When upgrading an existing installation, `init`, `config`, `build`, `up`,
+`restart`, and `deploy` add missing settings without replacing existing values.
+This includes `WM_SESSION_SECRET`, required by the upstream browser-session
+authentication added after the initial Podman release. Keep it stable across
+restarts. An explicitly empty or short value must be corrected in `.env`; the
+application rejects secrets shorter than 32 characters.
 
 The full host-side seeder fleet runs once on startup and then every 24 hours.
 Some backfills make hundreds of paced public API requests, while the AIS relay
@@ -70,6 +79,22 @@ re-execs the existing user manager through systemd's machine transport, and
 retries once. Native RHEL normally does not use this recovery path.
 
 ## Operations
+
+For a reviewed upstream merge on an integration branch, the pre-push commit-count
+guard accepts `WM_UPSTREAM_SYNC_SHA` set to the full imported commit SHA. It
+refreshes `upstream/main`, verifies that SHA is in both upstream and the local
+branch, and still limits fork-only commits. All checks against the fork's
+`origin/main` remain enabled. This option does not authorize merging or deploying.
+The identity guard likewise preserves authors in that verified upstream history;
+new fork commits and the shared Git identity configuration remain checked.
+Proto compatibility follows the documented JSON-only API contract. The first
+sync recognizes upstream's exact `FlowEstimate.source` string-to-enum transition
+with its preserved custom JSON values. Only the comparison descriptor is
+normalized; the real schema and all other compatibility checks remain intact.
+The upstream Railway rollout-evidence gate runs only in the upstream repository:
+its historical production activation acknowledgements do not describe a fresh
+self-hosted Redis instance. The checker regression tests and application tests
+still run in this fork; use local seeder and API verification for local readiness.
 
 ```bash
 ./scripts/podman-local.sh status

@@ -6,11 +6,17 @@
 
 import type { NewsItem, ClusteredEvent } from '@/types';
 import { getSourceTier } from '@/config';
+import { countPublisherFamilies } from '../../shared/publisher-families.js';
+import { analysisWorker } from './analysis-worker';
 import { clusterNewsCore } from './analysis-core';
 import { mlWorker } from './ml-worker';
 import { ML_THRESHOLDS } from '@/config/ml-config';
 
 export const MAX_SEMANTIC_CLUSTER_INPUT = 250;
+
+interface HybridClusteringOptions {
+  shouldContinue?: () => boolean;
+}
 
 export function clusterNews(items: NewsItem[]): ClusteredEvent[] {
   return clusterNewsCore(items, getSourceTier) as ClusteredEvent[];
@@ -30,12 +36,48 @@ function compareClustersForSemanticCandidate(a: ClusteredEvent, b: ClusteredEven
     || a.id.localeCompare(b.id);
 }
 
+export async function clusterNewsWithWorkerFallback(
+  items: NewsItem[],
+  options: HybridClusteringOptions = {},
+): Promise<ClusteredEvent[]> {
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  if (items.length === 0) return [];
+
+  try {
+    const clusters = await analysisWorker.clusterNews(items);
+    if (!shouldContinue()) return [];
+    if (clusters.length > 0) return clusters;
+    console.warn('[Clustering] Analysis worker returned no clusters, using local fallback');
+  } catch (error) {
+    if (!shouldContinue()) return [];
+    console.warn('[Clustering] Analysis worker failed, using local fallback:', error);
+  }
+
+  if (!shouldContinue()) return [];
+  return clusterNews(items);
+}
+
 /**
  * Hybrid clustering: Jaccard first, then semantic refinement if ML available
  */
-export async function clusterNewsHybrid(items: NewsItem[]): Promise<ClusteredEvent[]> {
-  // Step 1: Fast Jaccard clustering
-  const jaccardClusters = clusterNewsCore(items, getSourceTier) as ClusteredEvent[];
+export async function clusterNewsHybrid(
+  items: NewsItem[],
+  options: HybridClusteringOptions = {},
+): Promise<ClusteredEvent[]> {
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  const coreStartedAt = import.meta.env.VITE_E2E === '1' ? performance.now() : 0;
+  const jaccardClusters = await clusterNewsWithWorkerFallback(items, { shouldContinue });
+  if (import.meta.env.VITE_E2E === '1') {
+    performance.measure('wm:news-clustering:hybrid-core', {
+      start: coreStartedAt,
+      end: performance.now(),
+      detail: {
+        itemCount: items.length,
+        clusterCount: jaccardClusters.length,
+      },
+    });
+  }
+  if (!shouldContinue()) return [];
 
   // Step 2: If ML unavailable or too few clusters, return Jaccard results
   if (!mlWorker.isAvailable || jaccardClusters.length < ML_THRESHOLDS.minClustersForML) {
@@ -58,12 +100,14 @@ export async function clusterNewsHybrid(items: NewsItem[]): Promise<ClusteredEve
       clusterTexts,
       ML_THRESHOLDS.semanticClusterThreshold
     );
+    if (!shouldContinue()) return [];
 
     // Merge semantically similar clusters
     const mergedSemanticClusters = mergeSemanticallySimilarClusters(semanticCandidates, semanticGroups);
     return [...mergedSemanticClusters, ...overflowClusters]
       .sort((a, b) => b.lastUpdated.getTime() - a.lastUpdated.getTime());
   } catch (error) {
+    if (!shouldContinue()) return [];
     console.warn('[Clustering] Semantic clustering failed, using Jaccard only:', error);
     return jaccardClusters;
   }
@@ -145,6 +189,10 @@ function mergeSemanticallySimilarClusters(
       primaryLink: primary.primaryLink,
       primarySource: primary.primarySource,
       sourceCount: allItems.length,
+      // #6428: recomputed over the MERGED item list, not summed from the
+      // parts — two merged clusters can share a publisher, and adding their
+      // counts would re-create the double-count this field exists to prevent.
+      uniquePublisherCount: countPublisherFamilies(allItems.map(i => i.source)),
       topSources: sortedTopSources,
       allItems,
       firstSeen,

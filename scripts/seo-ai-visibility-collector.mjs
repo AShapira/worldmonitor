@@ -22,12 +22,12 @@ import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 
 import {
-  AI_PLATFORMS,
   PAGE_FAMILIES,
   BING_AI_METRICS,
   REFERRAL_METRICS,
   SEARCH_PERFORMANCE_METRICS,
   SEARCH_METRICS,
+  aiPlatformsForSchemaVersion,
   computeQuerySetDigest,
   isNonEmptyString,
   isWorldMonitorUrl,
@@ -849,9 +849,13 @@ function normalizeCollectionContext(raw, fallback) {
   };
 }
 
-function normalizeAiSurfaces(raw) {
+function normalizeAiSurfaces(raw, schemaVersion) {
+  const supportedPlatforms = aiPlatformsForSchemaVersion(schemaVersion);
+  if (schemaVersion === 2) {
+    invariant(raw != null, 'aiSurfaces is required for baseline schemaVersion 2');
+  }
   const surfaces = raw == null
-    ? AI_PLATFORMS.map((platform) => ({
+    ? supportedPlatforms.map((platform) => ({
       platform,
       status: 'unavailable',
       reason: 'No current AI surface manifest was supplied.',
@@ -1012,6 +1016,8 @@ export function collectBaseline({
     'repositoryRevision must be supplied when the local git revision is unavailable',
   );
   const normalizedRevision = boundedNonEmptyString(repositoryRevision, 'repositoryRevision');
+  const schemaVersion = sources.schemaVersion ?? template.schemaVersion;
+  aiPlatformsForSchemaVersion(schemaVersion);
 
   const googleSearchConsole = normalizeSearchExport(
     sources.googleSearchConsole,
@@ -1035,12 +1041,12 @@ export function collectBaseline({
     sources.collectionContext,
     template.collectionContext,
   );
-  const aiSurfaces = normalizeAiSurfaces(sources.aiSurfaces);
+  const aiSurfaces = normalizeAiSurfaces(sources.aiSurfaces, schemaVersion);
   const aiObservations = normalizeAiObservations(sources.aiObservations, querySet);
   const opportunities = normalizeOpportunities(sources.opportunities, template.opportunities);
   const guardrails = normalizeStringArray(template.guardrails, 'template.guardrails');
   const baseline = {
-    schemaVersion: template.schemaVersion,
+    schemaVersion,
     baselineId: observedAt.slice(0, 10),
     querySetId: querySet.querySetId,
     querySetDigest: computeQuerySetDigest(querySet),

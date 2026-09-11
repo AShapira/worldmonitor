@@ -12,6 +12,7 @@ const LAYER_KEYS: (keyof MapLayers)[] = [
   'irradiators',
   'sanctions',
   'weather',
+  'canadaRoads', 'canadaAlerts',
   'economic',
   'waterways',
   'outages',
@@ -55,8 +56,47 @@ export interface ParsedMapUrlState {
   chokepoint?: string;
 }
 
+/**
+ * True when applying this initial URL state starts an async camera move, so
+ * the immediate URL sync after boot must be skipped: getCenter() would report
+ * stale intermediate coordinates until the flight settles. Three cases:
+ *
+ *   - a lat+lon pair: applyInitialUrlState calls setCenter() only when both
+ *     are present, and setCenter flies.
+ *   - a bare zoom with no view preset: setZoom() animates.
+ *   - a chokepoint deep link: it opens after renderer readiness.
+ *
+ * `view` alone never qualifies. Every renderer writes state.view
+ * synchronously at the top of setView(), so the debounced read is correct,
+ * and the initial Globe/SVG view is applied before the sync listener exists,
+ * so those renderers need the immediate write to publish the URL at all.
+ */
+export function urlHasAsyncFlyTo(
+  state: Pick<ParsedMapUrlState, 'view' | 'lat' | 'lon' | 'zoom' | 'chokepoint'> | null | undefined,
+): boolean {
+  const { view, lat, lon, zoom, chokepoint } = state ?? {};
+  return (
+    (lat !== undefined && lon !== undefined)
+    || (!view && zoom !== undefined)
+    || chokepoint !== undefined
+  );
+}
+
 const clamp = (value: number, min: number, max: number): number =>
   Math.min(max, Math.max(min, value));
+
+/** SearchAction and dashboard deep links share `?q=`. Cap keeps a pasted URL bounded. */
+export const DASHBOARD_SEARCH_QUERY_MAX_CHARS = 200;
+
+export function readDashboardSearchQuery(search: string): string | null {
+  const raw = new URLSearchParams(search).get('q');
+  if (raw == null) return null;
+  const query = raw.trim();
+  if (!query) return null;
+  return query.length > DASHBOARD_SEARCH_QUERY_MAX_CHARS
+    ? query.slice(0, DASHBOARD_SEARCH_QUERY_MAX_CHARS)
+    : query;
+}
 
 const parseEnumParam = <T extends string>(
   params: URLSearchParams,
@@ -166,7 +206,7 @@ export function buildMapUrl(
   }
   const params = new URLSearchParams();
 
-  if (state.center) {
+  if (state.center && Number.isFinite(state.center.lat) && Number.isFinite(state.center.lon)) {
     params.set('lat', state.center.lat.toFixed(4));
     params.set('lon', state.center.lon.toFixed(4));
   }

@@ -18,6 +18,265 @@ function cachedCountry(iso2, cacheWrittenAt = 0) {
   };
 }
 
+function activityResult(portAccumMap, currentWindowRowCount = portAccumMap.size) {
+  return { portAccumMap, currentWindowRowCount };
+}
+
+
+describe('PortWatch activity observation recovery', () => {
+  it('keeps an explicit null max date separate from a missing aggregate row', () => {
+    const parse = portwatchSeed.parseMaxDateObservation;
+    assert.equal(typeof parse, 'function');
+
+    assert.deepEqual(
+      parse({ features: [{ attributes: { max_date: null } }] }),
+      { status: 'observed', maxDate: null },
+    );
+    assert.deepEqual(
+      parse({ features: [] }),
+      { status: 'failed', maxDate: null },
+    );
+    assert.deepEqual(
+      parse({ features: [{ attributes: {} }] }),
+      { status: 'failed', maxDate: null },
+    );
+  });
+
+  it('keeps ArcGIS string and epoch max dates as observed values', () => {
+    const parse = portwatchSeed.parseMaxDateObservation;
+
+    assert.deepEqual(
+      parse({ features: [{ attributes: { max_date: '2026-08-28' } }] }),
+      { status: 'observed', maxDate: '2026-08-28' },
+    );
+    assert.deepEqual(
+      parse({ features: [{ attributes: { max_date: Date.parse('2026-08-28T00:00:00Z') } }] }),
+      { status: 'observed', maxDate: '2026-08-28' },
+    );
+  });
+
+  it('rejects impossible calendar dates as malformed observations', () => {
+    const parse = portwatchSeed.parseMaxDateObservation;
+
+    assert.deepEqual(
+      parse({ features: [{ attributes: { max_date: '2026-02-30' } }] }),
+      { status: 'failed', maxDate: null },
+    );
+    assert.deepEqual(
+      parse({ features: [{ attributes: { max_date: '2025-02-29' } }] }),
+      { status: 'failed', maxDate: null },
+    );
+  });
+
+  it('retries an unverified empty country through the proxy path', async () => {
+    const recover = portwatchSeed.fetchCountryActivityWithRecovery;
+    assert.equal(typeof recover, 'function');
+    const calls = [];
+    const recovered = new Map([['bd-ctg', { portname: 'Chattogram' }]]);
+
+    const result = await recover('BGD', {
+      preflightObservation: { status: 'observed', maxDate: '2026-08-28' },
+      refMap: new Map([['bd-ctg', { lat: 22.3, lon: 91.8 }]]),
+      fetchAccumFn: async (_iso3, options) => {
+        calls.push(options);
+        return activityResult(options.forceProxy ? recovered : new Map());
+      },
+      sleepFn: async () => {},
+    });
+
+    assert.deepEqual(calls.map(({ forceProxy }) => forceProxy), [false, true]);
+    assert.equal(result.portAccumMap, recovered);
+    assert.equal(result.verifiedZero, false);
+  });
+
+  it('publishes zero only after an explicit null observation with current refs', async () => {
+    const recover = portwatchSeed.fetchCountryActivityWithRecovery;
+    let calls = 0;
+
+    const result = await recover('MSR', {
+      preflightObservation: { status: 'observed', maxDate: null },
+      refMap: new Map([['ms-lbr', { lat: 16.7, lon: -62.2 }]]),
+      fetchAccumFn: async (_iso3, options) => {
+        calls += 1;
+        assert.equal(options.forceProxy, false);
+        return activityResult(new Map());
+      },
+      sleepFn: async () => {},
+    });
+
+    assert.equal(calls, 1);
+    assert.equal(result.portAccumMap.size, 0);
+    assert.equal(result.verifiedZero, true);
+  });
+
+  it('keeps a repeated unverified empty result visible without ageing last-good data', async () => {
+    const recover = portwatchSeed.fetchCountryActivityWithRecovery;
+    const forceProxyCalls = [];
+    let reason;
+
+    try {
+      await recover('SOM', {
+        preflightObservation: { status: 'failed', maxDate: null },
+        refMap: new Map([['so-mog', { lat: 2.0, lon: 45.3 }]]),
+        fetchAccumFn: async (_iso3, options) => {
+          forceProxyCalls.push(options.forceProxy);
+          return activityResult(new Map());
+        },
+        sleepFn: async () => {},
+      });
+      assert.fail('expected the repeated empty result to reject');
+    } catch (err) {
+      reason = err;
+    }
+
+    assert.deepEqual(forceProxyCalls, [false, true]);
+    assert.equal(reason.refreshFailureCode, 'invalid_empty');
+
+    const item = cachedCountry('SO', 4 * DAY);
+    const state = portwatchSeed.buildRefreshFailureState(item, reason, 10 * DAY);
+    assert.equal(state.cacheWrittenAt, 4 * DAY);
+    assert.equal(state.refreshAttemptedAt, 10 * DAY);
+    assert.equal(state.refreshFailure.code, 'invalid_empty');
+  });
+
+  it('does not verify zero without current reference ports', async () => {
+    const forceProxyCalls = [];
+
+    await assert.rejects(
+      portwatchSeed.fetchCountryActivityWithRecovery('MSR', {
+        preflightObservation: { status: 'observed', maxDate: null },
+        refMap: new Map(),
+        fetchAccumFn: async (_iso3, options) => {
+          forceProxyCalls.push(options.forceProxy);
+          return activityResult(new Map());
+        },
+        sleepFn: async () => {},
+      }),
+      (err) => err?.refreshFailureCode === 'invalid_empty',
+    );
+
+    assert.deepEqual(forceProxyCalls, [false, true]);
+  });
+
+  it('retries when only the previous window returned rows', async () => {
+    const previousOnly = new Map([['bd-ctg', {
+      portname: 'Chattogram',
+      last30_calls: 0,
+      last30_count: 0,
+      last30_import: 0,
+      last30_export: 0,
+      prev30_calls: 12,
+    }]]);
+    const recovered = new Map([['bd-ctg', {
+      ...previousOnly.get('bd-ctg'),
+      last30_calls: 8,
+      last30_count: 1,
+    }]]);
+    const forceProxyCalls = [];
+
+    const result = await portwatchSeed.fetchCountryActivityWithRecovery('BGD', {
+      preflightObservation: { status: 'observed', maxDate: '2026-08-28' },
+      refMap: new Map([['bd-ctg', { lat: 22.3, lon: 91.8 }]]),
+      fetchAccumFn: async (_iso3, options) => {
+        forceProxyCalls.push(options.forceProxy);
+        return options.forceProxy
+          ? activityResult(recovered, 1)
+          : activityResult(previousOnly, 0);
+      },
+      sleepFn: async () => {},
+    });
+
+    assert.deepEqual(forceProxyCalls, [false, true]);
+    assert.equal(result.portAccumMap, recovered);
+    assert.equal(result.verifiedZero, false);
+  });
+
+  it('sends both forced activity windows through the proxy transport', async () => {
+    const directCalls = [];
+    const proxyCalls = [];
+    const controller = new AbortController();
+    const result = await portwatchSeed.fetchCountryAccum('BGD', {
+      signal: controller.signal,
+      anchorEpochMs: Date.parse('2026-08-28T23:59:59.999Z'),
+      dateField: 'date',
+      forceProxy: true,
+      fetchFn: async (...args) => {
+        directCalls.push(args);
+        throw new Error('direct transport must not run');
+      },
+      proxyRetryFn: async (url, reason, options) => {
+        proxyCalls.push({ url, reason, options });
+        const where = new URL(url).searchParams.get('where');
+        return where.includes('<=')
+          ? { features: [], exceededTransferLimit: false }
+          : {
+              features: [{
+                attributes: {
+                  portid: 'bd-ctg',
+                  portname: 'Chattogram',
+                  ISO3: 'BGD',
+                  date: '2026-08-28',
+                  portcalls_tanker: 8,
+                  import_tanker: 3,
+                  export_tanker: 2,
+                },
+              }],
+              exceededTransferLimit: false,
+            };
+      },
+      sleepFn: async () => {},
+    });
+
+    assert.equal(directCalls.length, 0);
+    assert.equal(proxyCalls.length, 2);
+    assert.ok(proxyCalls.every(({ reason }) => reason === 'unverified empty activity'));
+    assert.ok(proxyCalls.every(({ options }) => options.signal instanceof AbortSignal));
+    assert.equal(result.currentWindowRowCount, 1);
+    assert.deepEqual([...result.portAccumMap.keys()], ['bd-ctg']);
+  });
+
+  it('rejects when the proxy also returns only previous-window rows', async () => {
+    const previousOnly = new Map([['so-mog', {
+      portname: 'Mogadishu',
+      last30_calls: 0,
+      last30_count: 0,
+      last30_import: 0,
+      last30_export: 0,
+      prev30_calls: 4,
+    }]]);
+
+    await assert.rejects(
+      portwatchSeed.fetchCountryActivityWithRecovery('SOM', {
+        preflightObservation: { status: 'observed', maxDate: '2026-08-28' },
+        refMap: new Map([['so-mog', { lat: 2.0, lon: 45.3 }]]),
+        fetchAccumFn: async () => activityResult(previousOnly, 0),
+        sleepFn: async () => {},
+      }),
+      (err) => err?.refreshFailureCode === 'invalid_empty',
+    );
+  });
+
+  it('aborts the forced-proxy attempt signal when recovery fails', async () => {
+    let forcedSignal;
+
+    await assert.rejects(
+      portwatchSeed.fetchCountryActivityWithRecovery('SOM', {
+        preflightObservation: { status: 'failed', maxDate: null },
+        refMap: new Map([['so-mog', { lat: 2.0, lon: 45.3 }]]),
+        fetchAccumFn: async (_iso3, options) => {
+          if (!options.forceProxy) return activityResult(new Map());
+          forcedSignal = options.signal;
+          throw new Error('forced proxy window failed');
+        },
+        sleepFn: async () => {},
+      }),
+      /forced proxy window failed/,
+    );
+
+    assert.equal(forcedSignal.aborted, true);
+  });
+});
+
 describe('PortWatch cold-fetch recovery rotation', () => {
   it('attempts all 174 countries within six 30-country runs', () => {
     const countries = Array.from({ length: 174 }, (_, index) =>
@@ -139,6 +398,116 @@ describe('PortWatch last-good and gap reporting', () => {
     assert.equal(invalidQueryState.refreshFailure.code, 'invalid_query');
     assert.equal(rateLimitedState.refreshFailure.code, 'rate_limited');
   });
+
+  it('classifies proxy errors from ArcGIS errInfo while preserving the diagnostic reason', () => {
+    const createProxyError = portwatchSeed.createArcgisProxyError;
+    assert.equal(typeof createProxyError, 'function');
+
+    const invalidQueryError = createProxyError('HTTP 429 rate-limited', 'Invalid query parameters');
+    assert.match(invalidQueryError.message, /HTTP 429 rate-limited/);
+    assert.equal(
+      portwatchSeed.buildRefreshFailureState(cachedCountry('US'), invalidQueryError, 10 * DAY)
+        .refreshFailure.code,
+      'invalid_query',
+    );
+
+    const rateLimitedError = createProxyError('direct timeout', 'Too many requests (429)');
+    assert.equal(
+      portwatchSeed.buildRefreshFailureState(cachedCountry('CY'), rateLimitedError, 10 * DAY)
+        .refreshFailure.code,
+      'rate_limited',
+    );
+  });
+
+  it('retries one ArcGIS rate-limit failure when the country still has run budget', async () => {
+    const retryRateLimited = portwatchSeed.retryRateLimited;
+    assert.equal(typeof retryRateLimited, 'function');
+    let attempts = 0;
+    let firstAttemptSignal;
+    const sleepCalls = [];
+
+    const result = await retryRateLimited(async (attemptSignal) => {
+      attempts += 1;
+      if (attempts === 1) {
+        firstAttemptSignal = attemptSignal;
+        throw new Error('ArcGIS error: Unable to perform query. Too many requests.');
+      }
+      assert.equal(firstAttemptSignal.aborted, true);
+      return 'recovered';
+    }, {
+      sleepFn: async (delayMs) => {
+        sleepCalls.push(delayMs);
+      },
+    });
+
+    assert.equal(result, 'recovered');
+    assert.equal(attempts, 2);
+    assert.equal(sleepCalls.length, 1);
+    assert.equal(sleepCalls[0], 2_000);
+  });
+
+  it('does not retry unrelated ArcGIS failures', async () => {
+    const retryRateLimited = portwatchSeed.retryRateLimited;
+    let attempts = 0;
+    const sleepCalls = [];
+
+    await assert.rejects(
+      retryRateLimited(async () => {
+        attempts += 1;
+        throw new Error('ArcGIS error: Invalid query parameters');
+      }, {
+        sleepFn: async (...args) => {
+          sleepCalls.push(args);
+        },
+      }),
+      /Invalid query parameters/,
+    );
+
+    assert.equal(attempts, 1);
+    assert.equal(sleepCalls.length, 0);
+  });
+
+  it('bounds repeated rate-limit failures to one retry', async () => {
+    const retryRateLimited = portwatchSeed.retryRateLimited;
+    let attempts = 0;
+    const sleepCalls = [];
+    const delayMs = 321;
+
+    await assert.rejects(
+      retryRateLimited(async () => {
+        attempts += 1;
+        throw new Error('ArcGIS HTTP 429 rate-limited');
+      }, {
+        delayMs,
+        sleepFn: async (actualDelayMs) => {
+          sleepCalls.push({ actualDelayMs });
+        },
+      }),
+      /429 rate-limited/,
+    );
+
+    assert.equal(attempts, 2);
+    assert.equal(sleepCalls.length, 1);
+    assert.equal(sleepCalls[0].actualDelayMs, delayMs);
+  });
+
+  it('aborts the retry cooldown when the parent run is cancelled', async () => {
+    const retryRateLimited = portwatchSeed.retryRateLimited;
+    const controller = new AbortController();
+    let attempts = 0;
+
+    const retrying = retryRateLimited(async () => {
+      attempts += 1;
+      throw new Error('ArcGIS HTTP 429 rate-limited');
+    }, {
+      signal: controller.signal,
+      delayMs: 100,
+    });
+    setTimeout(() => controller.abort(new Error('run cancelled')), 0);
+
+    await assert.rejects(retrying, /run cancelled/);
+    assert.equal(attempts, 1);
+  });
 });
 
 describe('PortWatch canonical reference guard', () => {
@@ -210,6 +579,11 @@ describe('PortWatch atomic publication', () => {
         'supply_chain:portwatch-ports:v1:US',
         'supply_chain:portwatch-ports:v1:_countries',
         'seed-meta:supply_chain:portwatch-ports',
+        // #6060: the content-freshness activation marker commits in the SAME
+        // transaction as the meta it activates. If it landed separately, a
+        // partial failure could set the marker without the block, flipping
+        // health out of its pending grace onto a payload that lacks the field.
+        'seed-activated:supply_chain:portwatch-ports:content-freshness',
       ],
     );
   });
@@ -266,7 +640,7 @@ describe('PortWatch atomic publication', () => {
         fetchFn,
         credentials: { url: 'https://redis.example.test', token: 'token' },
       }),
-      /transaction: 1\/4 commands failed/,
+      /transaction: 1\/5 commands failed/,
     );
   });
 });

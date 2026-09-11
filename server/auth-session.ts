@@ -10,6 +10,8 @@
  */
 
 import { createRemoteJWKSet, jwtVerify } from 'jose';
+// @ts-expect-error — JS module, no declaration file
+import { captureSilentError } from '../api/_sentry-edge.js';
 
 // Clerk Backend API secret -- used to look up user metadata when the JWT
 // does not include a `plan` claim (i.e. standard session token, no template).
@@ -168,11 +170,13 @@ export function parsePlanLookupTimeoutMs(value: string | undefined): number {
 
 const PLAN_LOOKUP_TIMEOUT_MS = parsePlanLookupTimeoutMs(process.env.CLERK_PLAN_LOOKUP_TIMEOUT_MS);
 
-async function lookupPlanFromClerk(userId: string): Promise<'free' | 'pro'> {
+export type ClerkPlanLookupResult = 'free' | 'pro' | 'unavailable';
+
+export async function lookupClerkPlan(userId: string): Promise<ClerkPlanLookupResult> {
   const cached = _planCache.get(userId);
   if (cached && Date.now() < cached.expiresAt) return cached.role;
 
-  if (!CLERK_SECRET_KEY) return 'free';
+  if (!CLERK_SECRET_KEY) return 'unavailable';
   try {
     // Adversarial DoS guard: validateBearerToken awaits this on every standard
     // (non-template) session token, so a Clerk API stall would otherwise let an
@@ -186,24 +190,30 @@ async function lookupPlanFromClerk(userId: string): Promise<'free' | 'pro'> {
       },
       signal: AbortSignal.timeout(PLAN_LOOKUP_TIMEOUT_MS),
     });
-    if (!resp.ok) return 'free';
+    if (resp.status === 404) return 'free';
+    if (!resp.ok) {
+      console.warn(`[auth-session] Clerk plan lookup unavailable: http-${resp.status}`);
+      return 'unavailable';
+    }
     const user = (await resp.json()) as { public_metadata?: Record<string, unknown> };
     const role: 'free' | 'pro' = user.public_metadata?.plan === 'pro' ? 'pro' : 'free';
     _planCache.set(userId, { role, expiresAt: Date.now() + PLAN_CACHE_TTL_MS });
     return role;
   } catch (err) {
-    // Log, don't swallow. This path downgrades a PRO user to 'free' for the
-    // request, and the AbortSignal.timeout added above made it newly reachable
-    // from a plain Clerk stall rather than only from a hard network error. With
-    // no log, a sustained Clerk outage is indistinguishable from a fleet of
-    // genuinely free users — the failure mode is silent revenue-affecting
-    // degradation. Not cached (see above), so the next request retries.
+    void captureSilentError(err, {
+      tags: { route: 'server/auth-session', step: 'clerk-plan-lookup' },
+    });
     console.warn(
-      '[auth-session] lookupPlanFromClerk failed, degrading to free:',
+      '[auth-session] Clerk plan lookup unavailable:',
       err instanceof Error ? err.message : String(err),
     );
-    return 'free';
+    return 'unavailable';
   }
+}
+
+async function lookupPlanFromClerk(userId: string): Promise<'free' | 'pro'> {
+  const result = await lookupClerkPlan(userId);
+  return result === 'unavailable' ? 'free' : result;
 }
 
 /**

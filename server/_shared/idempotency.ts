@@ -28,12 +28,31 @@
  * after a transient upstream failure can still succeed.
  */
 
+import { getClientIp } from './client-ip';
 import { runRedisPipeline } from './redis';
 
 /** Canonical header name. Matched case-insensitively by `Headers.get`. */
 export const IDEMPOTENCY_HEADER = 'Idempotency-Key';
 /** Header echoed on the response indicating whether it was replayed. */
 export const IDEMPOTENT_REPLAYED_HEADER = 'Idempotent-Replayed';
+
+/**
+ * Routes that OWN their retry semantics and must never get generic whole-response replay.
+ *
+ * This is the single source of truth for the exemption. The gateway consults it before
+ * engaging the idempotency machinery, and `scripts/lib/openapi-codegen.mjs`
+ * (`readIdempotencyExemptPaths`) parses this literal so the published OpenAPI — which
+ * omits the Idempotency-Key parameter and the "invalid Idempotency-Key header" clause in
+ * the 400 for these paths — cannot drift from what the runtime actually does.
+ *
+ * `import-monitored-company-batch` returns per-row outcomes (CREATED / REPLAYED /
+ * CONFLICT / REJECTED / NO_OP). Replaying the whole response would freeze REJECTED and
+ * NO_OP rows instead of recomputing them against current state, which is exactly the
+ * tuple-level contract the import promises.
+ */
+export const IDEMPOTENCY_EXEMPT_RPC_PATHS = new Set<string>([
+  '/api/company-monitoring/v1/import-monitored-company-batch',
+]);
 
 // Printable-ASCII, 1..255 chars — matches the `maxLength: 255` we publish in
 // the OpenAPI spec (scripts/openapi-inject-idempotency.mjs). UUIDs, ULIDs, and
@@ -135,20 +154,26 @@ function isRetryableStatus(status: number): boolean {
 }
 
 /**
- * Best-effort anonymous scope from edge IP headers (Cloudflare → Vercel).
- * Public POST mutations (leads/submit-contact, leads/register-interest) have no
- * principal, so two anon callers behind the same NAT could share a scope — but
- * a same-key/same-body collision replays an identical deterministic response,
- * and a same-key/different-body collision is caught by the 422 body-hash guard,
- * so this is safe (not a cross-caller data leak).
+ * Best-effort anonymous scope for public POST mutations (leads/submit-contact,
+ * leads/register-interest), which have no principal to namespace by.
+ *
+ * Derives the IP through the hardened {@link getClientIp} rather than reading
+ * the forwarding headers directly: on a direct-to-origin hit `cf-connecting-ip`
+ * is fully client-controlled and `x-forwarded-for` is client-settable, so a
+ * caller could otherwise mint a fresh namespace per request (GHSA-c267, #3531,
+ * #6431) — or select another caller's. `getClientIp` requires proof of
+ * Cloudflare transit before trusting `cf-connecting-ip`. This matches
+ * `server/_shared/rate-limit.ts`, which builds the same `ip:` scope shape, and
+ * the leads handlers themselves, which already call `getClientIp` for turnstile
+ * and rate-limit decisions on the very same request.
+ *
+ * Two anon callers behind one NAT can still share a scope, but a
+ * same-key/same-body collision replays an identical deterministic response and
+ * a same-key/different-body collision is caught by the 422 body-hash guard, so
+ * sharing is not a cross-caller data leak.
  */
 function anonScope(request: Request): string {
-  const ip =
-    request.headers.get('cf-connecting-ip') ||
-    request.headers.get('x-real-ip') ||
-    (request.headers.get('x-forwarded-for') || '').split(',')[0]?.trim() ||
-    'unknown';
-  return `ip:${ip}`;
+  return `ip:${getClientIp(request)}`;
 }
 
 function jsonResponse(

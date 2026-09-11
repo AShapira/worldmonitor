@@ -15,6 +15,9 @@
 
 import { suggestTools } from './_agent-tool-suggest';
 import { PUBLIC_RESOURCE_REGISTRY } from './mcp/resources/index';
+import { readBoundedRequestBody, RequestBodyTooLargeError } from './mcp/bounded-body';
+import { MAX_JSON_RPC_BODY_BYTES } from './mcp/body-limits';
+import { safeJsonRpcId } from './mcp/utils';
 import { ENDPOINT_RATE_POLICIES, checkScopedRateLimit, getClientIp } from '../server/_shared/rate-limit';
 
 // Re-exported so existing consumers (tests, api/ask.ts historically) keep a
@@ -58,14 +61,21 @@ const BASE_HEADERS: Record<string, string> = {
 interface JsonRpcError {
   code: number;
   message: string;
+  /** Structured self-correction payload (e.g. the #7406 body-size rejection). */
+  data?: unknown;
 }
 
 type JsonRpcId = string | number | null;
 
-function rpcError(id: JsonRpcId, error: JsonRpcError, status = 200): Response {
+function rpcError(
+  id: JsonRpcId,
+  error: JsonRpcError,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify({ jsonrpc: '2.0', id, error }), {
     status,
-    headers: BASE_HEADERS,
+    headers: { ...BASE_HEADERS, ...extraHeaders },
   });
 }
 
@@ -89,7 +99,7 @@ const HOW_TO_CALL = {
   mcp: {
     endpoint: 'https://worldmonitor.app/mcp',
     transport: 'streamable-http',
-    note: "Issue tools/list for the live inventory (anonymous). Data calls need OAuth2 (scope=mcp) or an API key header 'X-WorldMonitor-Key: wm_<40-hex>' — issue one at https://worldmonitor.app/pro.",
+    note: "Issue tools/list for the live inventory (anonymous). get_sources is the sole credential-free, daily-quota-free data tool and has a separate fail-closed 10/min/IP ceiling; all other MCP data tools need subscription access through OAuth2 (scope=mcp) or 'X-WorldMonitor-Key: wm_<40-hex>' — issue one at https://worldmonitor.app/pro.",
   },
   rest: {
     base: 'https://api.worldmonitor.app',
@@ -203,6 +213,42 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
+  // Same shared JSON-RPC body cap as the MCP entry points (#7406): this route is
+  // anonymous and edge-run, and `extractText` walks every message part before the
+  // MAX_QUERY_CHARS slice, so the bytes must be bounded ahead of JSON.parse.
+  let bodyText: string;
+  try {
+    const bodyBytes = await readBoundedRequestBody(req, MAX_JSON_RPC_BODY_BYTES);
+    bodyText = new TextDecoder().decode(bodyBytes);
+  } catch (err) {
+    if (err instanceof RequestBodyTooLargeError) {
+      return rpcError(
+        null,
+        {
+          code: -32600,
+          message: err.message,
+          data: { reason: 'body-too-large', maxBytes: err.maxBytes, nextStep: 'Shrink the request body below maxBytes and retry.' },
+        },
+        413,
+      );
+    }
+    return rpcError(null, { code: -32700, message: 'Parse error: request body is not valid JSON.' });
+  }
+
+  // Bounded pre-parse is the explicit abuse/correlation tradeoff for this
+  // anonymous endpoint: the 256 KiB cap rejects before parsing, while an
+  // in-cap body is parsed before the limiter only far enough to recover a
+  // finite numeric or <=256-byte string id. Envelope validation and skill
+  // execution remain behind the unchanged 60/min/IP limiter.
+  let body: unknown;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    body = undefined;
+  }
+
+  const rpc = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown } | undefined;
+  const id = safeJsonRpcId(rpc?.id);
   const ip = getClientIp(req);
   // Redis-degraded scoped limits intentionally stay availability-first here:
   // this surface is anonymous, quota-free, and cheap (pure token matching
@@ -212,29 +258,21 @@ export default async function handler(req: Request): Promise<Response> {
   const scoped = await checkScopedRateLimit(RATE_LIMIT_SCOPE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, ip);
   if (!scoped.allowed) {
     const retryAfter = Math.max(1, Math.ceil((scoped.reset - Date.now()) / 1000));
-    return new Response(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: null,
-        error: {
-          code: RATE_LIMIT_ERROR_CODE,
-          message: `Rate limit exceeded. Max ${RATE_LIMIT_MAX} requests per ${RATE_LIMIT_WINDOW} per IP.`,
-        },
-      }),
-      { status: 429, headers: { ...BASE_HEADERS, 'Retry-After': String(retryAfter) } },
+    return rpcError(
+      id,
+      {
+        code: RATE_LIMIT_ERROR_CODE,
+        message: `Rate limit exceeded. Max ${RATE_LIMIT_MAX} requests per ${RATE_LIMIT_WINDOW} per IP.`,
+      },
+      429,
+      { 'Retry-After': String(retryAfter) },
     );
   }
 
-  let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
+  if (body === undefined) {
     return rpcError(null, { code: -32700, message: 'Parse error: request body is not valid JSON.' });
   }
 
-  const rpc = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: unknown };
-  const id: JsonRpcId =
-    typeof rpc?.id === 'string' || typeof rpc?.id === 'number' ? rpc.id : null;
   if (!rpc || rpc.jsonrpc !== '2.0' || typeof rpc.method !== 'string') {
     return rpcError(id, { code: -32600, message: "Invalid request: expected a JSON-RPC 2.0 envelope with a string 'method'." });
   }

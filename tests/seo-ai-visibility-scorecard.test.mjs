@@ -30,6 +30,34 @@ const baseline = readJson(
   'docs/research/seo-ai-visibility/baselines/2026-07-27.json',
 );
 
+const AI_PLATFORMS_V2 = Object.freeze([
+  'chatgpt_search',
+  'perplexity',
+  'google_ai_overview',
+  'google_ai_mode',
+  'copilot_search',
+]);
+
+function fiveSurfaceBaseline(source = baseline) {
+  const next = structuredClone(source);
+  next.schemaVersion = 2;
+  next.aiSurfaces = source.aiSurfaces.flatMap((surface) => (
+    surface.platform === 'google_ai'
+      ? [
+        { ...structuredClone(surface), platform: 'google_ai_overview' },
+        { ...structuredClone(surface), platform: 'google_ai_mode' },
+      ]
+      : [structuredClone(surface)]
+  ));
+  next.aiObservations = source.aiObservations.map((observation) => ({
+    ...structuredClone(observation),
+    platform: observation.platform === 'google_ai'
+      ? 'google_ai_overview'
+      : observation.platform,
+  }));
+  return next;
+}
+
 function buildComparableScorecards() {
   const currentBaseline = structuredClone(baseline);
   currentBaseline.baselineId = '2026-08-27';
@@ -320,6 +348,88 @@ describe('SEO and AI visibility baseline', () => {
     assert.equal(scorecard.ai.possible, 75);
     assert.equal(scorecard.ai.observed, 3);
     assert.equal(scorecard.ai.coverageRate, 0.04);
+  });
+
+  it('validates the explicit five-surface contract and separates its coverage denominators', () => {
+    const current = fiveSurfaceBaseline();
+    const modeObservation = {
+      ...structuredClone(
+        current.aiObservations.find(({ platform }) => platform === 'google_ai_overview'),
+      ),
+      platform: 'google_ai_mode',
+      directCitation: false,
+      citedUrls: [],
+      summary: 'Google AI Mode mentioned World Monitor without a direct citation.',
+    };
+    current.aiObservations.push(modeObservation);
+    const perplexity = current.aiSurfaces.find(({ platform }) => platform === 'perplexity');
+    perplexity.status = 'unavailable';
+    perplexity.reason = 'The surface was unavailable for this cycle.';
+    current.aiObservations = current.aiObservations.filter(
+      ({ platform }) => platform !== 'perplexity',
+    );
+
+    assert.doesNotThrow(() => validateBaseline(current, querySet));
+    assert.deepEqual(
+      current.aiSurfaces.map(({ platform }) => platform),
+      AI_PLATFORMS_V2,
+    );
+    const scorecard = buildScorecard(querySet, current);
+    assert.equal(scorecard.ai.targetPossible, 125);
+    assert.equal(scorecard.ai.possible, 100);
+    assert.equal(scorecard.ai.observed, 4);
+
+    const markdown = formatScorecardMarkdown(scorecard);
+    assert.match(markdown, /Google AI Overview/);
+    assert.match(markdown, /Google AI Mode/);
+    assert.match(markdown, /Actual observations: 4\./);
+    assert.match(markdown, /Available-surface target: 100 query\/platform pairs\./);
+    assert.match(markdown, /Full target matrix: 125 query\/platform pairs\./);
+  });
+
+  it('rejects duplicate, unknown, missing, and unavailable five-surface observations', () => {
+    const current = fiveSurfaceBaseline();
+    const overview = current.aiObservations.find(
+      ({ platform }) => platform === 'google_ai_overview',
+    );
+
+    const duplicate = structuredClone(current);
+    duplicate.aiObservations.push(structuredClone(overview));
+    assert.throws(
+      () => validateBaseline(duplicate, querySet),
+      /duplicate AI observation q01:google_ai_overview/,
+    );
+
+    const unknown = structuredClone(current);
+    unknown.aiSurfaces.find(
+      ({ platform }) => platform === 'google_ai_mode',
+    ).platform = 'google_ai_unknown';
+    assert.throws(
+      () => validateBaseline(unknown, querySet),
+      /aiSurfaces\[3\]\.platform is invalid/,
+    );
+
+    const missing = structuredClone(current);
+    missing.aiSurfaces = missing.aiSurfaces.filter(
+      ({ platform }) => platform !== 'google_ai_mode',
+    );
+    assert.throws(
+      () => validateBaseline(missing, querySet),
+      /aiSurfaces must contain every supported platform exactly once/,
+    );
+
+    const unavailable = structuredClone(current);
+    const mode = unavailable.aiSurfaces.find(({ platform }) => platform === 'google_ai_mode');
+    mode.status = 'unavailable';
+    mode.reason = 'The surface was unavailable for this cycle.';
+    unavailable.aiObservations.push({
+      ...structuredClone(overview),
+      platform: 'google_ai_mode',
+    });
+    assert.throws(
+      () => validateBaseline(unavailable, querySet),
+      /aiObservations\[4\]\.platform is unavailable/,
+    );
   });
 
   it('rejects committed property IDs, malformed guardrails, and invalid priorities', () => {
@@ -879,6 +989,85 @@ describe('scorecard computation', () => {
       })),
       [{ queryId: 'q01', platform: 'chatgpt_search' }],
     );
+  });
+
+  it('marks newly tracked surfaces not comparable across contract versions', () => {
+    const previousBaseline = structuredClone(baseline);
+    const previousOverview = previousBaseline.aiObservations.find(
+      ({ platform }) => platform === 'google_ai',
+    );
+    previousOverview.directCitation = false;
+    previousOverview.citedUrls = [];
+
+    const currentBaseline = fiveSurfaceBaseline();
+    currentBaseline.baselineId = '2026-08-27';
+    currentBaseline.observedAt = '2026-08-27T12:00:00Z';
+    const currentOverview = currentBaseline.aiObservations.find(
+      ({ platform }) => platform === 'google_ai_overview',
+    );
+    currentBaseline.aiObservations.push({
+      ...structuredClone(currentOverview),
+      platform: 'google_ai_mode',
+      summary: 'Google AI Mode directly cited World Monitor.',
+    });
+
+    const previous = buildScorecard(querySet, previousBaseline);
+    const current = buildScorecard(querySet, currentBaseline);
+    const comparison = compareScorecards(previous, current);
+
+    assert.deepEqual(comparison.platformCoverage.previousOnly, []);
+    assert.deepEqual(comparison.platformCoverage.currentOnly, ['google_ai_mode']);
+    assert.deepEqual(
+      comparison.newCitations.map(({ queryId, platform }) => ({ queryId, platform })),
+      [{ queryId: 'q01', platform: 'google_ai_overview' }],
+    );
+    assert.deepEqual(comparison.newlyObserved, []);
+    assert.deepEqual(
+      comparison.notComparable.current.map(({ queryId, platform }) => ({ queryId, platform })),
+      [{ queryId: 'q01', platform: 'google_ai_mode' }],
+    );
+
+    current.comparison = comparison;
+    const markdown = formatScorecardMarkdown(current);
+    assert.match(markdown, /Platform coverage changed/);
+    assert.match(markdown, /current-only: Google AI Mode \(`google_ai_mode`\)/);
+    assert.match(markdown, /Not comparable.*q01 on Google AI Mode/);
+  });
+
+  it('compares like-for-like AI Mode observations in five-surface cycles', () => {
+    const previousBaseline = fiveSurfaceBaseline();
+    previousBaseline.baselineId = '2026-08-01';
+    previousBaseline.observedAt = '2026-08-01T12:00:00Z';
+    const overview = previousBaseline.aiObservations.find(
+      ({ platform }) => platform === 'google_ai_overview',
+    );
+    previousBaseline.aiObservations.push({
+      ...structuredClone(overview),
+      platform: 'google_ai_mode',
+      directCitation: false,
+      citedUrls: [],
+      summary: 'Google AI Mode mentioned World Monitor without a direct citation.',
+    });
+    const currentBaseline = structuredClone(previousBaseline);
+    currentBaseline.baselineId = '2026-08-27';
+    currentBaseline.observedAt = '2026-08-27T12:00:00Z';
+    const currentMode = currentBaseline.aiObservations.find(
+      ({ platform }) => platform === 'google_ai_mode',
+    );
+    currentMode.directCitation = true;
+    currentMode.citedUrls = ['https://www.worldmonitor.app/'];
+    currentMode.summary = 'Google AI Mode directly cited World Monitor.';
+
+    const comparison = compareScorecards(
+      buildScorecard(querySet, previousBaseline),
+      buildScorecard(querySet, currentBaseline),
+    );
+
+    assert.deepEqual(
+      comparison.newCitations.map(({ queryId, platform }) => ({ queryId, platform })),
+      [{ queryId: 'q01', platform: 'google_ai_mode' }],
+    );
+    assert.deepEqual(comparison.notComparable, { previous: [], current: [] });
   });
 
   it('compares finite metrics from partial provider exports', () => {

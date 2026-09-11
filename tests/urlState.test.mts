@@ -1,6 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseMapUrlState, buildMapUrl } from '../src/utils/urlState.ts';
+import {
+  parseMapUrlState,
+  buildMapUrl,
+  readDashboardSearchQuery,
+  DASHBOARD_SEARCH_QUERY_MAX_CHARS,
+} from '../src/utils/urlState.ts';
 
 const EMPTY_LAYERS = {
   conflicts: false, bases: false, cables: false, pipelines: false,
@@ -47,6 +52,26 @@ describe('parseMapUrlState expanded param', () => {
   });
 });
 
+describe('readDashboardSearchQuery', () => {
+  it('reads a SearchAction term from ?q=', () => {
+    assert.equal(readDashboardSearchQuery('?q=hormuz%20strait'), 'hormuz strait');
+  });
+
+  it('trims whitespace and ignores empty values', () => {
+    assert.equal(readDashboardSearchQuery('?q=%20%20'), null);
+    assert.equal(readDashboardSearchQuery('?q='), null);
+    assert.equal(readDashboardSearchQuery('?country=IR'), null);
+  });
+
+  it('caps oversized pasted queries', () => {
+    const oversized = 'a'.repeat(DASHBOARD_SEARCH_QUERY_MAX_CHARS + 25);
+    assert.equal(
+      readDashboardSearchQuery(`?q=${oversized}`)?.length,
+      DASHBOARD_SEARCH_QUERY_MAX_CHARS,
+    );
+  });
+});
+
 describe('parseMapUrlState chokepoint param', () => {
   it('parses a canonical chokepoint id', () => {
     const state = parseMapUrlState('?chokepoint=bab_el_mandeb', EMPTY_LAYERS);
@@ -66,6 +91,51 @@ describe('parseMapUrlState chokepoint param', () => {
 
   it('leaves chokepoint undefined when absent', () => {
     assert.equal(parseMapUrlState('?country=IR', EMPTY_LAYERS).chokepoint, undefined);
+  });
+});
+
+describe('buildMapUrl non-finite centre (#7660)', () => {
+  const base = 'https://worldmonitor.app/dashboard';
+  const baseState = {
+    view: 'global' as const,
+    zoom: 2,
+    timeRange: '24h' as const,
+    layers: EMPTY_LAYERS,
+  };
+
+  it('omits lat/lon when the centre is NaN', () => {
+    const url = buildMapUrl(base, { ...baseState, center: { lat: NaN, lon: NaN } });
+    const params = new URL(url).searchParams;
+    assert.equal(params.get('lat'), null);
+    assert.equal(params.get('lon'), null);
+    assert.ok(!url.includes('NaN'), `url must not contain NaN: ${url}`);
+  });
+
+  it('omits lat/lon when only one coordinate is non-finite', () => {
+    for (const center of [
+      { lat: NaN, lon: 12.5 },
+      { lat: 51.5, lon: NaN },
+      { lat: Infinity, lon: 0 },
+      { lat: 0, lon: -Infinity },
+    ]) {
+      const url = buildMapUrl(base, { ...baseState, center });
+      assert.ok(!url.includes('NaN'), `url must not contain NaN: ${url}`);
+      assert.ok(!url.includes('Infinity'), `url must not contain Infinity: ${url}`);
+    }
+  });
+
+  it('still emits a finite centre', () => {
+    const url = buildMapUrl(base, { ...baseState, center: { lat: 51.5074, lon: -0.1278 } });
+    const params = new URL(url).searchParams;
+    assert.equal(params.get('lat'), '51.5074');
+    assert.equal(params.get('lon'), '-0.1278');
+  });
+
+  it('round-trips a NaN centre to a parse that yields no coordinates', () => {
+    const url = buildMapUrl(base, { ...baseState, center: { lat: NaN, lon: NaN } });
+    const state = parseMapUrlState(new URL(url).search, EMPTY_LAYERS);
+    assert.equal(state.lat, undefined);
+    assert.equal(state.lon, undefined);
   });
 });
 

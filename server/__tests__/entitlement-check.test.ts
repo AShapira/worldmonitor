@@ -56,11 +56,33 @@ function makeEntitlements(tier: number, planKey = "free") {
       // _getEntitlementsImpl (round-2 P2-cache fix), so test fixtures
       // must include it to be considered fresh.
       mcpAccess: tier >= 1,
+      // Partner embed access is also part of the persisted cache schema.
+      // Legacy rows without the boolean must reload through Convex before any
+      // authorization decision, including short-lived verification markers.
+      embedAccess: tier >= 1,
       // Plan 2026-07-25-001 U1 added dataExport. Mirrors the catalog for the
       // tiers this factory can express — Pro Business also exports at tier 1,
       // but it is not reachable through a tier-only fixture. Deliberately NOT
       // part of the cache-staleness gate (undefined fail-opens at tier >= 2).
       dataExport: tier >= 2,
+      // #6105 added planLimits.dashboardAiCallsPerDay and, for exactly the
+      // reason mcpAccess above joined the gate, it is part of the
+      // cache-staleness check too: a cached row missing it would be served as
+      // fresh and silently resolve every paid tier above Pro to the Pro
+      // default. Fixtures must carry it to read as fresh.
+      planLimits: {
+        apiRequestsPerDay: tier >= 2 ? 1_000 : 0,
+        apiBurstRequestsPerMinute: tier >= 2 ? 60 : 0,
+        // Third field to join the cache-staleness gate, for the same reason as
+        // the two above. An apiAccess plan carrying a NUMERIC mcpCallsPerDay is
+        // a pre-marker row by construction: the catalog gives the API tiers the
+        // shared-budget marker and enterprise `null`, so that pairing cannot
+        // occur in production. A tier-only factory reaches the API tiers at
+        // tier >= 2, so they take the marker here.
+        mcpCallsPerDay: tier >= 2 ? "shared-api-budget" : (tier >= 1 ? 50 : 0),
+        dashboardAiCallsPerDay: tier >= 1 ? 500 : 0,
+        mcpBurstRequestsPerMinute: tier >= 1 ? 60 : 0,
+      },
     },
     validUntil: FUTURE,
   };
@@ -115,6 +137,39 @@ async function withConvexEntitlementFetch<T>(
   }
 }
 
+function withoutEmbedAccess(entitlements: ReturnType<typeof makeEntitlements>) {
+  const { embedAccess: _embedAccess, ...features } = entitlements.features;
+  return { ...entitlements, features };
+}
+
+async function withCachedEntitlementResponse<T>(
+  cached: unknown,
+  payload: unknown,
+  run: (fetchMock: ReturnType<typeof vi.fn>) => Promise<T>,
+): Promise<T> {
+  const originalSiteUrl = process.env.CONVEX_SITE_URL;
+  const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+  process.env.CONVEX_SITE_URL = "https://example-deployment.convex.site";
+  process.env.CONVEX_SERVER_SHARED_SECRET = "test-secret";
+  vi.mocked(getCachedJson).mockResolvedValueOnce(cached);
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    return await run(fetchMock);
+  } finally {
+    if (originalSiteUrl === undefined) delete process.env.CONVEX_SITE_URL;
+    else process.env.CONVEX_SITE_URL = originalSiteUrl;
+    if (originalSecret === undefined) delete process.env.CONVEX_SERVER_SHARED_SECRET;
+    else process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
+    vi.unstubAllGlobals();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -127,6 +182,23 @@ describe("gateway entitlement check", () => {
     "/api/market/v1/backtest-stock",
     "/api/market/v1/list-stored-stock-backtests",
   ])("getRequiredTier returns 1 for %s (regression-lock against tier-2 revert)", (path) => {
+    expect(getRequiredTier(path)).toBe(1);
+  });
+
+  // The seven routes closed by the #6436-#6449 gating pass. Each shipped
+  // ungated because its originating issue scoped ingestion + exposure and never
+  // named an access tier; an anonymous wms_ session read full payloads from all
+  // seven in production. Pinned by path so a revert has to delete a named test,
+  // not just drop a line from a 37-entry object literal.
+  test.each([
+    "/api/market/v1/get-physical-premiums",
+    "/api/market/v1/get-physical-divergence-index",
+    "/api/supply-chain/v1/get-mineral-production",
+    "/api/military/v1/get-defense-industrial-base",
+    "/api/supply-chain/v1/get-country-vulnerabilities",
+    "/api/supply-chain/v1/get-chokepoint-dependencies",
+    "/api/supply-chain/v1/list-vulnerability-rankings",
+  ])("getRequiredTier returns 1 for newly gated %s (#6436-#6449)", (path) => {
     expect(getRequiredTier(path)).toBe(1);
   });
 
@@ -395,7 +467,98 @@ describe("gateway entitlement check", () => {
     });
   });
 
-  test("serves a short-lived verification marker from Redis without another Convex request", async () => {
+  test.each([
+    ["paid", 1, "pro_monthly", true],
+    ["free", 0, "free", false],
+  ] as const)(
+    "legacy %s cache row without embedAccess reloads and rewrites the canonical shape",
+    async (_label, tier, planKey, expectedEmbedAccess) => {
+      const canonical = makeEntitlements(tier, planKey);
+      const legacy = withoutEmbedAccess(canonical);
+
+      await withCachedEntitlementResponse(
+        legacy,
+        canonical,
+        async (fetchMock) => {
+          const result = await getEntitlements(`legacy-embed-${planKey}`);
+
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+          expect(result?.features.embedAccess).toBe(expectedEmbedAccess);
+          expect(setCachedJson).toHaveBeenLastCalledWith(
+            `entitlements:test:legacy-embed-${planKey}`,
+            canonical,
+            900,
+            true,
+          );
+        },
+      );
+    },
+  );
+
+  test("legacy billing-status marker without embedAccess reloads before the marker cache return", async () => {
+    const marker = {
+      ...makeEntitlements(1, "pro_monthly"),
+      billingStatus: "renewal_verification_pending" as const,
+      retryAfterSeconds: 11,
+    };
+    const legacyMarker = {
+      ...withoutEmbedAccess(makeEntitlements(1, "pro_monthly")),
+      billingStatus: marker.billingStatus,
+      retryAfterSeconds: marker.retryAfterSeconds,
+    };
+
+    await withCachedEntitlementResponse(
+      legacyMarker,
+      marker,
+      async (fetchMock) => {
+        const result = await getEntitlements("legacy-embed-billing-marker");
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(result?.features.embedAccess).toBe(true);
+        expect(setCachedJson).toHaveBeenLastCalledWith(
+          "entitlements:test:legacy-embed-billing-marker",
+          marker,
+          11,
+          true,
+        );
+      },
+    );
+  });
+
+  test("legacy renewal-freshness marker without embedAccess reloads before the marker cache return", async () => {
+    const marker = {
+      ...makeEntitlements(0),
+      validUntil: 0,
+      renewalVerificationFreshness: {
+        status: "not_applicable" as const,
+        checkedAt: Date.now(),
+      },
+    };
+    const legacyMarker = {
+      ...withoutEmbedAccess(makeEntitlements(0)),
+      validUntil: 0,
+      renewalVerificationFreshness: marker.renewalVerificationFreshness,
+    };
+
+    await withCachedEntitlementResponse(
+      legacyMarker,
+      marker,
+      async (fetchMock) => {
+        const result = await getEntitlements("legacy-embed-renewal-marker");
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(result?.features.embedAccess).toBe(false);
+        expect(setCachedJson).toHaveBeenLastCalledWith(
+          "entitlements:test:legacy-embed-renewal-marker",
+          marker,
+          60,
+          true,
+        );
+      },
+    );
+  });
+
+  test("serves a current-shape billing marker from Redis without another Convex request", async () => {
     vi.mocked(getCachedJson).mockResolvedValueOnce({
       ...makeEntitlements(0),
       validUntil: 0,
@@ -419,7 +582,7 @@ describe("gateway entitlement check", () => {
     }
   });
 
-  test("serves a recent not-applicable freshness marker without another Convex request", async () => {
+  test("serves a current-shape renewal-freshness marker without another Convex request", async () => {
     vi.mocked(getCachedJson).mockResolvedValueOnce({
       ...makeEntitlements(0),
       validUntil: 0,
@@ -661,6 +824,61 @@ describe("gateway entitlement check", () => {
       expect(fetchMock).toHaveBeenCalledTimes(0); // cache hit, no Convex call
     } finally {
       vi.unstubAllGlobals();
+    }
+  });
+
+  test("#6105 cache: entry WITHOUT planLimits.dashboardAiCallsPerDay is stale and refetches", async () => {
+    // A row cached before the dashboard-AI dimension shipped already satisfies
+    // the mcpAccess check, so without this gate it would be served as fresh --
+    // and Pro Business (2,500) / API Business (10,000) would silently enforce
+    // the 500 Pro default for the whole cache TTL. The window is NOT bounded by
+    // that TTL either: the Convex catalog deploy is a separate manual step from
+    // the edge deploy, so an edge-first release would under-serve every paid
+    // tier until Convex lands.
+    const preDimensionCache = {
+      planKey: "pro_business_monthly",
+      features: {
+        tier: 1,
+        apiAccess: false,
+        apiRateLimit: 0,
+        maxDashboards: 25,
+        prioritySupport: true,
+        exportFormats: ["csv", "json", "pdf"],
+        mcpAccess: true, // present -- passes the OLD gate on its own
+        planLimits: {
+          apiRequestsPerDay: 0,
+          apiBurstRequestsPerMinute: 0,
+          mcpCallsPerDay: 250,
+          mcpBurstRequestsPerMinute: 60,
+          // NO dashboardAiCallsPerDay -- pre-#6105 cache entry.
+        },
+      },
+      validUntil: FUTURE,
+    };
+    vi.mocked(getCachedJson).mockResolvedValueOnce(preDimensionCache);
+
+    const originalSiteUrl = process.env.CONVEX_SITE_URL;
+    const originalSecret = process.env.CONVEX_SERVER_SHARED_SECRET;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(makeEntitlements(1, "pro_business_monthly")), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    process.env.CONVEX_SITE_URL = "https://example-deployment.convex.site";
+    process.env.CONVEX_SERVER_SHARED_SECRET = "test-secret";
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      const result = await getEntitlements("user_pre_dimension");
+
+      // Fell through to Convex, which returns the merged shape.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(result?.features.planLimits?.dashboardAiCallsPerDay).toBe(500);
+    } finally {
+      vi.unstubAllGlobals();
+      process.env.CONVEX_SITE_URL = originalSiteUrl;
+      process.env.CONVEX_SERVER_SHARED_SECRET = originalSecret;
     }
   });
 

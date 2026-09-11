@@ -13,9 +13,8 @@ paths:
             tags:
                 - SeismologyService
             summary: ListEarthquakes
-            description: ListEarthquakes retrieves recent earthquakes from the USGS GeoJSON feed.
+            description: ListEarthquakes retrieves recent earthquakes from USGS and Earthquakes Canada (NRCan).
             operationId: ListEarthquakes
-            security: []
             parameters:
                 - name: start
                   in: query
@@ -81,14 +80,14 @@ paths:
                         application/json:
                             example:
                                 "earthquakes":
-                                    - "concernLevel": "example"
+                                    - "category": "cs.AI"
+                                      "concernLevel": "example"
                                       "concernScore": 42.5
                                       "depthKm": 1.5
                                       "id": "example-id"
                                       "location":
                                           "latitude": 40.7128
                                           "longitude": -74.006
-                                      "magnitude": 1.5
                                 "pagination":
                                     "nextCursor": "next-page-token"
                                     "totalCount": 1
@@ -102,6 +101,23 @@ paths:
                                 oneOf:
                                     - $ref: '#/components/schemas/ValidationError'
                                     - $ref: '#/components/schemas/JmespathProjectionError'
+                "401":
+                    description: Missing or invalid API key.
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/UnauthorizedError'
+                "403":
+                    description: API access requires an active subscription (the API key's subscription is inactive or expired).
+                    headers:
+                        X-Billing-Verification:
+                            description: Present when the 403 is a billing-provider-confirmed subscription lapse (value subscription_lapsed, matching the body `code`).
+                            schema:
+                                type: string
+                    content:
+                        application/json:
+                            schema:
+                                $ref: '#/components/schemas/ForbiddenError'
                 "429":
                     description: Rate limit exceeded.
                     headers:
@@ -127,6 +143,31 @@ paths:
                                 oneOf:
                                     - $ref: '#/components/schemas/Error'
                                     - $ref: '#/components/schemas/RateLimitError'
+                "503":
+                    description: Service unavailable. Billing-verification responses include code and X-Billing-Verification; other gateway infrastructure failures use the generic GatewayError shape.
+                    headers:
+                        Retry-After:
+                            description: Seconds to wait before retrying (1-60).
+                            schema:
+                                type: string
+                        X-Billing-Verification:
+                            description: Billing-verification state that produced this response (matches the body `code`).
+                            schema:
+                                type: string
+                        X-Validation-Mode:
+                            description: Present with value degraded when user API-key validation is temporarily unavailable.
+                            schema:
+                                type: string
+                        X-RateLimit-Mode:
+                            description: Present with value degraded when a fail-closed rate-limit dependency is unavailable.
+                            schema:
+                                type: string
+                    content:
+                        application/json:
+                            schema:
+                                oneOf:
+                                    - $ref: '#/components/schemas/BillingVerificationError'
+                                    - $ref: '#/components/schemas/GatewayError'
                 default:
                     description: Gateway or handler error response.
                     content:
@@ -163,6 +204,15 @@ components:
                 - _jmespath_error
                 - original_keys
             type: object
+        UnauthorizedError:
+            type: object
+            properties:
+                error:
+                    type: string
+                    description: Human-readable error message.
+            required:
+                - error
+            description: Returned when the API key is missing, malformed, or lacks current API access.
         Error:
             type: object
             properties:
@@ -170,6 +220,27 @@ components:
                     type: string
                     description: Error message (e.g., 'user not found', 'database connection failed')
             description: Error is returned when a handler encounters an error. It contains a simple error message that the developer can customize.
+        BillingVerificationError:
+            type: object
+            description: "Returned with HTTP 503 when paid access cannot be confirmed right now: the billing provider is re-verifying a recently expired subscription, or the entitlement backend is unreachable. Retryable — honor Retry-After."
+            properties:
+                error:
+                    type: string
+                    description: Human-readable billing-verification failure reason.
+                code:
+                    type: string
+                    enum:
+                        - renewal_verification_pending
+                        - renewal_verification_failed
+                        - entitlement_verification_unavailable
+                    description: Machine-readable billing-verification state, mirrored in the X-Billing-Verification response header.
+                requiredTier:
+                    type: integer
+                    format: int32
+                    description: Minimum entitlement tier required for this endpoint, when the denial came from a tier gate.
+            required:
+                - error
+                - code
         InvalidRequestBodyError:
             type: object
             description: Returned when a JSON POST request body is empty or malformed.
@@ -200,6 +271,31 @@ components:
                     description: Human-readable rate-limit failure reason.
             required:
                 - error
+        ForbiddenError:
+            type: object
+            properties:
+                error:
+                    type: string
+                    description: Human-readable entitlement failure reason.
+                code:
+                    type: string
+                    enum:
+                        - subscription_lapsed
+                    description: Machine-readable denial code, present when the 403 is a billing-provider-confirmed subscription lapse (mirrored in the X-Billing-Verification response header).
+                requiredTier:
+                    type: integer
+                    format: int32
+                    description: Minimum entitlement tier required for this endpoint.
+                currentTier:
+                    type: integer
+                    format: int32
+                    description: Caller entitlement tier when known.
+                planKey:
+                    type: string
+                    description: Caller plan key when known.
+            required:
+                - error
+            description: Returned when a PRO-gated endpoint denies access because the caller has no resolved authenticated user, entitlements cannot be verified, or the caller lacks the required entitlement tier.
         FieldViolation:
             type: object
             properties:
@@ -256,7 +352,7 @@ components:
                     description: |-
                         Minimum magnitude filter (e.g., 4.0 for significant quakes).
                          Accepted but currently ignored; no-op until this handler supports the parameter.
-            description: ListEarthquakesRequest specifies filters for retrieving earthquake data from USGS.
+            description: ListEarthquakesRequest specifies filters for retrieving earthquake data from USGS and Earthquakes Canada (NRCan).
         ListEarthquakesResponse:
             type: object
             properties:
@@ -274,7 +370,7 @@ components:
                     type: string
                     maxLength: 100
                     minLength: 1
-                    description: Unique USGS event identifier (e.g., "us7000abcd").
+                    description: 'Event identifier: USGS id (e.g. "us7000abcd") or namespaced NRCan id (e.g. "nrcan:20260813.0954001").'
                 place:
                     type: string
                     description: Human-readable place description (e.g., "10 km SW of Anchorage, Alaska").
@@ -294,7 +390,7 @@ components:
                     description: 'Time the earthquake occurred, as Unix epoch milliseconds.. Warning: Values > 2^53 may lose precision in JavaScript'
                 sourceUrl:
                     type: string
-                    description: URL to the USGS event detail page.
+                    description: URL to the USGS or Earthquakes Canada event detail page.
                 nearTestSite:
                     type: boolean
                     description: True when epicenter is within 100 km of a known nuclear test site.
@@ -308,9 +404,15 @@ components:
                 concernLevel:
                     type: string
                     description: 'Human-readable concern level: "low" | "moderate" | "elevated" | "critical".'
+                source:
+                    type: string
+                    description: 'Reporting agency: "usgs" (USGS) or "nrcan" (Earthquakes Canada / NRCan).'
+                category:
+                    type: string
+                    description: NRCan event category when present (e.g. "known earthquake", "suspected industry-related"). Empty for USGS.
             required:
                 - id
-            description: Earthquake represents a seismic event from USGS GeoJSON feed.
+            description: Earthquake represents a seismic event from USGS and Earthquakes Canada (NRCan).
         GeoCoordinates:
             type: object
             properties:

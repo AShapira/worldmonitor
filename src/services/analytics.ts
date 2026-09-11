@@ -10,6 +10,8 @@ import { subscribeAuthState, type AuthSession } from './auth-state';
 import { onSubscriptionChange, type SubscriptionInfo } from './billing';
 import { getClerkUserCreatedAt } from './clerk';
 import { DODO_PRODUCT_IDS } from '@/config/product-ids.generated';
+import { SITE_VARIANT, isSiteVariant } from '@/config/variant';
+import { isAgentPanelViewSuppressed } from './agent-analytics-privacy';
 import type { ActivationEventName, ActivationStepId } from './pro-activation-state';
 import {
   collectorFailureFromError,
@@ -26,6 +28,25 @@ import {
   getContentAttributionForAnalytics,
   withContentAttribution,
 } from '../../shared/content-attribution';
+import { MISSION_PRESET_IDS } from '../../shared/mission-domain';
+import {
+  isCheckoutSurface,
+  parseCheckoutContext,
+  resolveCheckoutContext,
+  type CheckoutAttribution,
+  type CheckoutContext,
+  type CheckoutSurface,
+} from '../../shared/checkout-attribution';
+import {
+  loadCheckoutReturnState,
+  settleMissionReturnDelivery,
+} from './checkout-return-state';
+
+export type {
+  CheckoutAttribution,
+  CheckoutContext,
+  CheckoutSurface,
+} from '../../shared/checkout-attribution';
 
 const UMAMI_SCRIPT_SRC = 'https://abacus.worldmonitor.app/script.js';
 const UMAMI_COLLECTOR_ENDPOINT = new URL('/api/send', UMAMI_SCRIPT_SRC).href;
@@ -43,7 +64,12 @@ const UMAMI_WEBSITE_ID = 'e8800335-c853-46a8-8497-c993ed2f58bc';
 // to www in production, and the tracker's data-domains check is an EXACT
 // hostname match (`!domains.includes(hostname)` → disabled) — with only the
 // apex listed, every event from the canonical host was silently dropped.
-const UMAMI_DOMAINS = 'worldmonitor.app,www.worldmonitor.app,happy.worldmonitor.app';
+// finance re-added 2026-09-04 (option 2, mission-funnel measurement): the
+// finance-only nq-day-trader mission was invisible to the funnel with the
+// tracker self-disabled there. Upstream #4183 still drops 4-8% of /api/send
+// on affected hosts — accepted noise; durable checkout markers already
+// tolerate collector failures. tech/commodity stay out until #4183 ships.
+const UMAMI_DOMAINS = 'worldmonitor.app,www.worldmonitor.app,happy.worldmonitor.app,finance.worldmonitor.app';
 const UMAMI_QUEUE_LIMIT = 50;
 const UMAMI_LOAD_ATTEMPT_LIMIT = 2;
 const UMAMI_LOAD_RETRY_DELAY_MS = 5_000;
@@ -54,6 +80,7 @@ const CRITICAL_TRACK_EVENTS = new Set<UmamiEvent>([
   'checkout-start',
   'checkout-success',
   'checkout-failed',
+  'mission-returned-after-purchase',
 ]);
 
 type QueuedUmamiCall =
@@ -122,6 +149,7 @@ const EVENTS = {
   'mcp-panel-add': true,
   // WebMCP (in-page agent tool surface)
   'webmcp-registered': true,
+  'webmcp-registration-failed': true,
   'webmcp-tool-invoked': true,
   // Route Explorer
   'route-explorer:opened': true,
@@ -169,6 +197,33 @@ const EVENTS = {
   'pro-activation-step-blocked': true,
   'pro-activation-step-failed': true,
   'pro-activation-exit': true,
+  // Passkey offer funnel. Five events, and the boundaries are load-bearing:
+  // `accepted` fires once per MOUNTED offer (not per tap), so a cancel-then-
+  // retry does not read as two accepts against one creation and fabricate an
+  // abandonment rate. `failed` is terminal-only — retryable outcomes
+  // (cancellation, transient/config errors) emit nothing, because they are not
+  // outcomes, they are the user still deciding. `dismissed` means a voluntary
+  // rejection ONLY; letting a technical failure also emit it would inflate the
+  // dismissal guardrail with our own bugs.
+  'passkey-offer-shown': true,
+  'passkey-offer-accepted': true,
+  'passkey-offer-created': true,
+  'passkey-offer-failed': true,
+  'passkey-offer-dismissed': true,
+  // Mission conversion funnel (ONBOARDING_STRATEGY.md, plan 2026-08-30-001).
+  // Picker -> selection -> panel views -> preview -> attributed checkout.
+  // `panel-viewed` is global (the funnel needs a denominator) but deduped per
+  // panel per tab session inside trackPanelView, so volume stays bounded.
+  // The pro-preview-* and mission-returned-after-purchase names are pinned
+  // here from Release 0 so dashboards can be built before Release 1 emits
+  // them; their emission sites land with the preview component.
+  'mission-picker-shown': true,
+  'mission-selected': true,
+  'panel-viewed': true,
+  'pro-preview-viewed': true,
+  'pro-preview-cta': true,
+  'pro-preview-dismissed': true,
+  'mission-returned-after-purchase': true,
 } as const;
 
 export type UmamiEvent = keyof typeof EVENTS;
@@ -197,12 +252,21 @@ export type UmamiEvent = keyof typeof EVENTS;
  *   origin engaged the request and may have written the event row before
  *   failing. The in-page retry already refuses to re-send it for exactly that
  *   reason; leaving the marker armed would let the next boot re-send it anyway.
+ * - a RACED failure -> the transport ignored our abort, so the collector
+ *   transport released its serialized slot while the request was still on the
+ *   wire (#6288). It may commit at any moment. `isRetryableCollectorFailure`
+ *   already refuses to re-send it in-page for that reason, and the boot replay
+ *   is the second door onto the same duplicate — so it settles too.
  * - queue-overflow / missing-receipt / network / timeout -> no row can exist
- *   (never dispatched, or accepted-and-discarded, or never answered), so the
- *   marker must survive and replay. These are recoveries, not duplicates.
+ *   (never dispatched, or accepted-and-discarded, or answered by nothing after
+ *   a cancellation the transport honored), so the marker must survive and
+ *   replay. These are recoveries, not duplicates.
  */
 function isDurableMarkerResolved(failure: CollectorOutcome['failure']): boolean {
   if (failure === null) return true;
+  // Checked BEFORE the `kind` gate: a raced failure is a `timeout`, which the
+  // rule below would otherwise treat as "never answered, safe to replay".
+  if (failure.raced) return true;
   if (failure.kind !== 'http') return false;
   return !isRetryableCollectorFailure(failure);
 }
@@ -232,6 +296,7 @@ function handleCollectorOutcome(outcome: CollectorOutcome): void {
   if (!isDurableMarkerResolved(outcome.failure)) return;
 
   if (outcome.eventName === 'checkout-success') clearPendingCheckoutSuccessMarker();
+  if (outcome.eventName === 'mission-returned-after-purchase') settleMissionReturnDelivery();
   if (outcome.eventName === 'checkout-start' && isReplayedCheckoutStart(outcome.requestBody)) {
     noteProFunnelReplayDelivered();
   }
@@ -413,6 +478,7 @@ function scheduleTrackRetry(call: Extract<QueuedUmamiCall, { kind: 'track' }>, e
  */
 function clearUnobservableCriticalMarker(call: Extract<QueuedUmamiCall, { kind: 'track' }>): void {
   if (call.event === 'checkout-success') clearPendingCheckoutSuccessMarker();
+  if (call.event === 'mission-returned-after-purchase') settleMissionReturnDelivery();
   if (call.event === 'checkout-start' && call.data?.replayed === true) {
     noteProFunnelReplayDelivered();
   }
@@ -511,6 +577,20 @@ export function track(event: UmamiEvent, data?: Record<string, unknown>): void {
   const enrichedData = withContentAttribution(data, getContentAttributionForAnalytics());
   if (!sendUmamiCall({ kind: 'track', event, data: enrichedData })) {
     queueUmamiCall({ kind: 'track', event, data: enrichedData });
+  }
+}
+
+/**
+ * Sends a deliberately closed telemetry payload without automatic content
+ * attribution. Agent search uses this path because #6212 permits only its
+ * explicit tool/outcome and aggregate search fields.
+ */
+export function trackPrivacyRestricted(
+  event: UmamiEvent,
+  data?: Record<string, unknown>,
+): void {
+  if (!sendUmamiCall({ kind: 'track', event, data })) {
+    queueUmamiCall({ kind: 'track', event, data });
   }
 }
 
@@ -735,6 +815,40 @@ export function trackSignOut(): void {
 }
 
 /**
+ * Passkey offer funnel.
+ *
+ * Plain `track()`, deliberately — the same path `trackSignIn`/`trackSignUp`
+ * use. These are steps in the same auth lifecycle, so splitting them onto a
+ * different tracker would make passkey telemetry inconsistent with the sign-in
+ * telemetry beside it for no privacy gain.
+ *
+ * No user id, email, credential material, or passkey identifier in any payload.
+ * That is not a claim of anonymity: `identifyUser()` already attributes every
+ * Umami event to the Clerk id, so these are per-user records of a
+ * security-posture change and should be treated as such.
+ */
+export function trackPasskeyOfferShown(): void {
+  track('passkey-offer-shown');
+}
+
+export function trackPasskeyOfferAccepted(): void {
+  track('passkey-offer-accepted');
+}
+
+export function trackPasskeyOfferCreated(): void {
+  track('passkey-offer-created');
+}
+
+/** `reason` is a coarse closed vocabulary — never a raw Clerk error string. */
+export function trackPasskeyOfferFailed(reason: string): void {
+  track('passkey-offer-failed', { reason });
+}
+
+export function trackPasskeyOfferDismissed(): void {
+  track('passkey-offer-dismissed');
+}
+
+/**
  * Test-only: reset module-level deferred-load state so each test starts from
  * a clean slate. The queue and load guards are module singletons that persist
  * across the shared module import in tests/secondary-startup.test.mts.
@@ -857,20 +971,111 @@ function forgetPendingConversion(event: PendingConversion['event']): void {
  * redirect. Entries stay durable until the collector confirms them, so this is
  * a no-op on ordinary boots.
  */
+/**
+ * Rebuild a stored pending-conversion payload from an allowlist before
+ * replaying it. Write-time bucketing does not protect this path — the entry
+ * sat in sessionStorage, which a crafted value can reach directly — so the
+ * replay re-derives every field: ids through their bucketers, surface
+ * restricted to the known union, authed coerced, unknown keys dropped.
+ * Mirrors the sanitize-on-read rule the /pro funnel replay already follows.
+ */
+function sanitizePendingConversionData(
+  event: PendingConversion['event'],
+  data: Record<string, unknown>,
+): Record<string, unknown> {
+  if (event === 'checkout-failed') {
+    const status = data.status;
+    return {
+      status: typeof status === 'string' && CHECKOUT_FAILED_STATUSES.has(status) ? status : 'other',
+    };
+  }
+  const out: Record<string, unknown> = {
+    productId: bucketProductIdForAnalytics(typeof data.productId === 'string' ? data.productId : ''),
+    surface: isCheckoutSurface(data.surface)
+      ? data.surface
+      : 'dashboard',
+    authed: data.authed === true,
+  };
+  if (typeof data.missionId === 'string') out.missionId = bucketMissionIdForAnalytics(data.missionId);
+  if (typeof data.panelKey === 'string') out.panelKey = bucketPanelKeyForAnalytics(data.panelKey);
+  if (typeof data.variant === 'string' && isSiteVariant(data.variant)) out.variant = data.variant;
+  if (data.deviceClass === 'mobile' || data.deviceClass === 'desktop') out.deviceClass = data.deviceClass;
+  return out;
+}
+
+/**
+ * Return-leg reader (plan U4): the originating mission/panel of the checkout
+ * that just completed, straight from the durable pending-conversion entry —
+ * read BEFORE the boot replay's collector confirmation can clear it. Values
+ * were bucketed at write time and are re-validated by the caller's tracker.
+ */
+export function peekPendingMissionAttribution(): {
+  missionId: string;
+  panelKey?: string;
+  surface?: string;
+} | null {
+  // Positional: only the NEWEST checkout-start counts — falling through to
+  // older entries would attribute this purchase to an earlier abandoned
+  // attempt. Values are re-bucketed on read: this store is attacker-writable
+  // (same sanitize-on-read rule as sanitizePendingConversionData).
+  const newest = readPendingConversions().reverse().find((item) => item.event === 'checkout-start');
+  if (!newest) return null;
+  const rawMission = newest.data.missionId;
+  if (typeof rawMission !== 'string') return null;
+  const missionId = bucketMissionIdForAnalytics(rawMission);
+  if (missionId === 'unknown') return null;
+  const rawPanel = newest.data.panelKey;
+  const panelKey = typeof rawPanel === 'string' ? bucketPanelKeyForAnalytics(rawPanel) : 'unknown';
+  const rawSurface = newest.data.surface;
+  return {
+    missionId,
+    ...(panelKey !== 'unknown' ? { panelKey } : {}),
+    ...(isCheckoutSurface(rawSurface) ? { surface: rawSurface } : {}),
+  };
+}
+
 export function replayPendingConversionEvents(): void {
   for (const item of readPendingConversions()) {
-    track(item.event, { ...item.data, replayed: true });
+    track(item.event, { ...sanitizePendingConversionData(item.event, item.data), replayed: true });
   }
 }
 
 export function trackCheckoutStart(
   productId: string,
   authed: boolean,
-  surface: 'dashboard' | 'dashboard-resume' = 'dashboard',
-): void {
-  const data = { productId: bucketProductIdForAnalytics(productId), surface, authed };
+  surface: CheckoutSurface = 'dashboard',
+  attribution?: CheckoutAttribution,
+  existingContext?: CheckoutContext,
+): CheckoutContext {
+  // Seeded with the shared funnel context (variant, deviceClass, ambient
+  // missionId) so the baseline read can segment checkout-starts. Semantics of
+  // missionId on this event: ambient mission context when the surface is a
+  // generic one ('dashboard'), preview-attributed when explicit attribution
+  // overrides it below (surface 'mission-preview').
+  const funnelFields = missionFunnelFields();
+  const parsedContext = parseCheckoutContext(existingContext);
+  const context = parsedContext
+    ? { ...parsedContext, eventSurface: surface }
+    : resolveCheckoutContext({
+      surface,
+      attribution,
+      ambientMissionId: funnelFields.missionId,
+    });
+  const data: Record<string, unknown> = {
+    ...funnelFields,
+    productId: bucketProductIdForAnalytics(productId),
+    surface: context.eventSurface,
+    authed,
+  };
+  if (context.origin.missionId) {
+    data.missionId = context.origin.missionId;
+  }
+  if (context.origin.kind === 'mission-preview') {
+    data.panelKey = context.origin.panelKey;
+  }
   rememberPendingConversion('checkout-start', data);
   track('checkout-start', data);
+  return context;
 }
 
 /**
@@ -1118,7 +1323,301 @@ export function trackProActivation(
 
 export function trackEvent(_name: string, _props?: Record<string, unknown>): void {}
 export function trackEventBeforeUnload(_name: string, _props?: Record<string, unknown>): void {}
-export function trackPanelView(_panelId: string): void {}
+
+// ---------------------------------------------------------------------------
+// Mission conversion funnel (ONBOARDING_STRATEGY.md, plan 2026-08-30-001)
+// ---------------------------------------------------------------------------
+
+/**
+ * Keep 768 in sync with MOBILE_BREAKPOINT_PX in src/utils/index.ts (and the
+ * matching media query noted in src/styles/main.css). Duplicated literally
+ * rather than imported so the analytics module graph stays free of the utils
+ * barrel, which is not safely importable under node for tests.
+ */
+const MISSION_FUNNEL_MOBILE_BREAKPOINT_PX = 768;
+
+function analyticsDeviceClass(): 'mobile' | 'desktop' {
+  if (typeof window === 'undefined') return 'desktop';
+  return window.innerWidth <= MISSION_FUNNEL_MOBILE_BREAKPOINT_PX ? 'mobile' : 'desktop';
+}
+
+/**
+ * Mission-id vocabulary and storage key, duplicated literally from
+ * src/services/mission-presets.ts and pinned against it by
+ * tests/mission-funnel-events.test.mts. Importing mission-presets here would
+ * drag config/panels' side-effectful chain (runtime-config registers window
+ * listeners at import) into the analytics module graph — the same reason
+ * KNOWN_PRODUCT_IDS is a separate generated module (#5165).
+ */
+const MISSION_PRESET_STORAGE_KEY = 'worldmonitor-mission-preset-v1';
+const KNOWN_MISSION_IDS = new Set<string>(MISSION_PRESET_IDS);
+
+/** Unknown mission ids collapse to 'unknown' — closed vocabulary, like productId. */
+export function bucketMissionIdForAnalytics(missionId: string): string {
+  return KNOWN_MISSION_IDS.has(missionId) ? missionId : 'unknown';
+}
+
+/**
+ * Panel keys at every call site are code-controlled (panel registry constants,
+ * `data-panel` attributes our own mount code writes), so this is a structural
+ * guard, not a catalog check: anything that does not look like a panel key
+ * collapses to 'unknown'. The full catalog lives in config/panels, whose
+ * import-time side effects must stay out of the analytics graph. The registry
+ * mixes kebab-case and camelCase ids (`gccNews`, `regionalStartups`), so the
+ * shape allows interior uppercase; the real-catalog sweep in
+ * tests/mission-funnel-events.test.mts pins that every live key passes.
+ */
+const PANEL_KEY_PATTERN = /^[a-z][a-zA-Z0-9-]{0,39}$/;
+
+/**
+ * User-created panels carry generated ids (`cw-<uuid>` custom widgets,
+ * `mcp-<uuid>` MCP panels) that pass the structural guard but would fragment
+ * the funnel into one Umami row per widget instance. Collapse each family to
+ * a stable bucket before the shape check.
+ */
+const DYNAMIC_PANEL_KEY_BUCKETS: ReadonlyArray<[prefix: string, bucket: string]> = [
+  ['cw-', 'custom-widget'],
+  ['mcp-', 'mcp-panel'],
+];
+
+export function bucketPanelKeyForAnalytics(panelKey: string): string {
+  for (const [prefix, bucket] of DYNAMIC_PANEL_KEY_BUCKETS) {
+    if (panelKey.startsWith(prefix)) return bucket;
+  }
+  return PANEL_KEY_PATTERN.test(panelKey) ? panelKey : 'unknown';
+}
+
+/**
+ * Shared context fields for every mission-funnel event: the active mission (if
+ * any), the site variant, and the device class. The stored mission id is
+ * validated against the closed vocabulary, so a corrupted localStorage value
+ * reads as absent rather than flowing to Umami.
+ */
+function missionFunnelFields(): Record<string, unknown> {
+  const fields: Record<string, unknown> = {
+    variant: SITE_VARIANT,
+    deviceClass: analyticsDeviceClass(),
+  };
+  try {
+    const stored = window.localStorage.getItem(MISSION_PRESET_STORAGE_KEY);
+    if (stored && KNOWN_MISSION_IDS.has(stored)) fields.missionId = stored;
+  } catch {
+    // Storage denied — the event still carries variant + device class.
+  }
+  return fields;
+}
+
+/**
+ * Session-scoped dedupe for panel-viewed (KTD5): a panel fires once per tab
+ * session, not once per page load, so reload-heavy dashboard sessions do not
+ * multiply the funnel denominator. sessionStorage is per-tab; when it is
+ * unavailable the in-memory set still bounds a single page's emissions.
+ */
+const PANEL_VIEWED_SESSION_KEY = 'wm-panel-viewed-v1';
+const PANEL_VIEWED_SESSION_LIMIT = 400;
+let viewedPanelsMemory = new Set<string>();
+
+function readViewedPanelsFromSession(): string[] {
+  try {
+    const raw = window.sessionStorage.getItem(PANEL_VIEWED_SESSION_KEY);
+    if (!raw) return [];
+    const items: unknown = JSON.parse(raw);
+    return Array.isArray(items) ? items.filter((i): i is string => typeof i === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberViewedPanel(panelId: string): void {
+  viewedPanelsMemory.add(panelId);
+  try {
+    const items = readViewedPanelsFromSession();
+    items.push(panelId);
+    window.sessionStorage.setItem(
+      PANEL_VIEWED_SESSION_KEY,
+      JSON.stringify(items.slice(-PANEL_VIEWED_SESSION_LIMIT)),
+    );
+  } catch {
+    // Storage denied — the in-memory set still dedupes this page.
+  }
+}
+
+function hasViewedPanel(panelId: string): boolean {
+  if (viewedPanelsMemory.has(panelId)) return true;
+  return readViewedPanelsFromSession().includes(panelId);
+}
+
+/** `keepSession: true` clears only the in-memory set — simulates a page reload. */
+export function resetMissionFunnelAnalyticsForTesting(opts?: { keepSession?: boolean }): void {
+  viewedPanelsMemory = new Set();
+  if (opts?.keepSession) return;
+  try {
+    window.sessionStorage.removeItem(PANEL_VIEWED_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Real emitter for the former no-op: one event per panel per tab session,
+ * carrying the funnel context. Callers (the IntersectionObserver in
+ * event-handlers) may keep their own cheap in-memory dedupe; the authoritative
+ * session dedupe lives here so every caller gets it.
+ */
+export function trackPanelView(panelId: string): void {
+  if (hasViewedPanel(panelId)) return;
+  rememberViewedPanel(panelId);
+  track('panel-viewed', { panelKey: bucketPanelKeyForAnalytics(panelId), ...missionFunnelFields() });
+}
+
+export type MissionPickerTrigger = 'auto' | 'manual' | 'agent';
+
+export function trackMissionPickerShown(
+  trigger: MissionPickerTrigger,
+  surface: 'desktop' | 'mobile',
+): void {
+  track('mission-picker-shown', { trigger, surface, ...missionFunnelFields() });
+}
+
+/** `source: 'agent'` marks WebMCP-applied presets so the human funnel can be read clean. */
+export function trackMissionSelected(missionId: string, source: 'user' | 'agent' = 'user'): void {
+  track('mission-selected', {
+    ...missionFunnelFields(),
+    missionId: bucketMissionIdForAnalytics(missionId),
+    source,
+  });
+}
+
+function trackProPreviewEvent(
+  event: 'pro-preview-viewed' | 'pro-preview-cta' | 'pro-preview-dismissed' | 'mission-returned-after-purchase',
+  missionId: string,
+  panelKey: string,
+): void {
+  track(event, {
+    ...missionFunnelFields(),
+    missionId: bucketMissionIdForAnalytics(missionId),
+    panelKey: bucketPanelKeyForAnalytics(panelKey),
+  });
+}
+
+/**
+ * Guardrail-denominator integrity (review findings on the pre-registered
+ * dismissal-rate rollback): viewed is once per preview per tab session — a
+ * render is not a view, and mission flapping or per-country widget re-creates
+ * must not multiply the denominator — and agent-driven mounts (WebMCP mission
+ * applies / set_panel_enabled) are suppressed via the same per-panel window
+ * panel-viewed uses, so the human funnel reads clean. Centralized here so the
+ * component, ResilienceWidget's crisis-desk surface, and any future caller
+ * share one contract.
+ */
+const PRO_PREVIEW_VIEWED_SESSION_KEY = 'wm-pro-preview-viewed-v1';
+const PRO_PREVIEW_DISMISSED_SESSION_KEY = 'wm-pro-preview-dismissed-v1';
+let proPreviewViewedMemory = new Set<string>();
+let proPreviewDismissedMemory = new Set<string>();
+
+export function resetProPreviewViewedForTesting(): void {
+  proPreviewViewedMemory = new Set();
+  proPreviewDismissedMemory = new Set();
+  try {
+    window.sessionStorage.removeItem(PRO_PREVIEW_VIEWED_SESSION_KEY);
+    window.sessionStorage.removeItem(PRO_PREVIEW_DISMISSED_SESSION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+function hasTrackedProPreviewDismissed(id: string): boolean {
+  if (proPreviewDismissedMemory.has(id)) return true;
+  try {
+    const raw = window.sessionStorage.getItem(PRO_PREVIEW_DISMISSED_SESSION_KEY);
+    const items: unknown = raw ? JSON.parse(raw) : null;
+    return Array.isArray(items) && items.includes(id);
+  } catch {
+    return false;
+  }
+}
+
+function rememberProPreviewDismissed(id: string): void {
+  proPreviewDismissedMemory.add(id);
+  try {
+    const raw = window.sessionStorage.getItem(PRO_PREVIEW_DISMISSED_SESSION_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    const items = Array.isArray(parsed) ? parsed.filter((i): i is string => typeof i === 'string') : [];
+    items.push(id);
+    window.sessionStorage.setItem(PRO_PREVIEW_DISMISSED_SESSION_KEY, JSON.stringify(items.slice(-100)));
+  } catch {}
+}
+
+function hasTrackedProPreviewViewed(id: string): boolean {
+  if (proPreviewViewedMemory.has(id)) return true;
+  try {
+    const raw = window.sessionStorage.getItem(PRO_PREVIEW_VIEWED_SESSION_KEY);
+    const items: unknown = raw ? JSON.parse(raw) : null;
+    return Array.isArray(items) && items.includes(id);
+  } catch {
+    return false;
+  }
+}
+
+function rememberProPreviewViewed(id: string): void {
+  proPreviewViewedMemory.add(id);
+  try {
+    const raw = window.sessionStorage.getItem(PRO_PREVIEW_VIEWED_SESSION_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    const items = Array.isArray(parsed) ? parsed.filter((i): i is string => typeof i === 'string') : [];
+    items.push(id);
+    window.sessionStorage.setItem(PRO_PREVIEW_VIEWED_SESSION_KEY, JSON.stringify(items.slice(-100)));
+  } catch {
+    // Storage denied — the in-memory set still dedupes this page.
+  }
+}
+
+export function trackProPreviewViewed(missionId: string, panelKey: string): void {
+  if (isAgentPanelViewSuppressed(panelKey)) return;
+  const id = `${bucketMissionIdForAnalytics(missionId)}:${bucketPanelKeyForAnalytics(panelKey)}`;
+  if (hasTrackedProPreviewViewed(id)) return;
+  rememberProPreviewViewed(id);
+  trackProPreviewEvent('pro-preview-viewed', missionId, panelKey);
+}
+
+export function trackProPreviewCta(missionId: string, panelKey: string): void {
+  trackProPreviewEvent('pro-preview-cta', missionId, panelKey);
+}
+
+export function trackProPreviewDismissed(missionId: string, panelKey: string): void {
+  const id = `${bucketMissionIdForAnalytics(missionId)}:${bucketPanelKeyForAnalytics(panelKey)}`;
+  if (hasTrackedProPreviewDismissed(id)) return;
+  rememberProPreviewDismissed(id);
+  trackProPreviewEvent('pro-preview-dismissed', missionId, panelKey);
+}
+
+export function trackMissionReturnedAfterPurchase(
+  missionId: string,
+  panelKey: string,
+  surface?: string,
+): void {
+  track('mission-returned-after-purchase', {
+    ...missionFunnelFields(),
+    missionId: bucketMissionIdForAnalytics(missionId),
+    panelKey: bucketPanelKeyForAnalytics(panelKey),
+    // Distinguishes a preview-originated purchase from an ambient-context
+    // one — day-30 completion reads split on this.
+    ...(surface ? { surface } : {}),
+  });
+}
+
+export function replayPendingMissionReturn(): void {
+  const state = loadCheckoutReturnState();
+  if (!state || state.delivery.missionReturn !== 'pending') return;
+  const { origin } = state.context;
+  if (!origin.missionId) return;
+  trackMissionReturnedAfterPurchase(
+    origin.missionId,
+    origin.kind === 'mission-preview' ? origin.panelKey : 'unknown',
+    state.context.eventSurface,
+  );
+}
+
 export function trackApiKeysSnapshot(): void {}
 export function trackUpdateShown(_current: string, _remote: string): void {}
 export function trackUpdateClicked(_version: string): void {}
@@ -1133,8 +1632,12 @@ export function trackSearchUsed(queryLength: number, resultCount: number): void 
   track('search-used', { queryLength, resultCount });
 }
 
-export function trackSearchResultSelected(resultType: string): void {
-  track('search-result-selected', { type: resultType });
+export function trackSearchResultSelected(
+  resultType: string,
+  options?: { includeAttribution?: boolean },
+): void {
+  const tracker = options?.includeAttribution === false ? trackPrivacyRestricted : track;
+  tracker('search-result-selected', { type: resultType });
 }
 
 // ---------------------------------------------------------------------------

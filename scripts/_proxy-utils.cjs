@@ -8,8 +8,11 @@ const zlib = require('node:zlib');
 const DECODO_GATE_HOST = 'gate.decodo.com';
 // Decodo's curl endpoint differs from its CONNECT endpoint.
 const DECODO_CURL_HOST = 'us.decodo.com';
-const DECODO_STICKY_PORT_MIN = 10_001;
-const DECODO_STICKY_PORT_MAX = 49_999;
+// Country endpoints have their own sticky ranges; never wrap into another pool.
+const DECODO_STICKY_PORT_RANGES = new Map([
+  [DECODO_GATE_HOST, [10_001, 49_999]],
+  ['cn.decodo.com', [30_001, 39_999]],
+]);
 
 function parseProxyConfig(raw) {
   if (!raw) return null;
@@ -55,7 +58,7 @@ function parseProxyConfig(raw) {
 }
 
 /**
- * Parse a proxy configuration and, for Decodo sticky gateway ports, advance
+ * Parse a proxy configuration and, for supported Decodo sticky ports, advance
  * each retry to a distinct sticky session. Other providers and Decodo rotating
  * ports retain their configured route exactly.
  */
@@ -67,20 +70,21 @@ function parseProxyConfigForAttempt(raw, attempt = 0) {
   // whatever casing the operator typed, while the URL form is lowercased by the
   // URL parser. config.host stays verbatim so the connection is unchanged.
   const host = String(config.host || '').toLowerCase().replace(/\.$/u, '');
+  const range = DECODO_STICKY_PORT_RANGES.get(host);
   if (
-    host !== DECODO_GATE_HOST
+    !range
     || !Number.isInteger(port)
-    || port < DECODO_STICKY_PORT_MIN
-    || port > DECODO_STICKY_PORT_MAX
+    || port < range[0]
+    || port > range[1]
   ) {
     return config;
   }
 
-  const stickyPortCount = DECODO_STICKY_PORT_MAX - DECODO_STICKY_PORT_MIN + 1;
+  const [minPort, maxPort] = range;
+  const stickyPortCount = maxPort - minPort + 1;
   return {
     ...config,
-    port: DECODO_STICKY_PORT_MIN
-      + ((port - DECODO_STICKY_PORT_MIN + attempt) % stickyPortCount),
+    port: minPort + ((port - minPort + attempt) % stickyPortCount),
   };
 }
 
@@ -116,9 +120,40 @@ function resolveProxyString(raw = process.env.PROXY_URL || '') {
   //   - a prefix match rewrites ANY `gate.*` host, so an unrelated proxy would be
   //     redirected to a Decodo endpoint with its credentials attached. Matching
   //     the one host we actually mean keeps every other provider untouched.
+  return curlProxyString(cfg);
+}
+
+/** Shared by resolveProxyString and resolveProxyStringForAttempt. */
+function curlProxyString(cfg) {
   const normalizedHost = String(cfg.host || '').toLowerCase().replace(/\.$/u, '');
   const host = normalizedHost === DECODO_GATE_HOST ? DECODO_CURL_HOST : cfg.host;
   return cfg.auth ? `${cfg.auth}@${host}:${cfg.port}` : `${host}:${cfg.port}`;
+}
+
+/**
+ * resolveProxyString, but advancing Decodo sticky sessions so each attempt lands
+ * on a DIFFERENT residential exit IP.
+ *
+ * Some upstreams answer HTTP 200 with a payload whose completeness depends on
+ * the exit IP rather than on the request. Yahoo's quote fundamentals cache is
+ * one: measured across 10 rotated Decodo exits, 7 omitted `trailingPE` entirely
+ * for a stable subset of ETFs while 3 served it. Retrying a pinned exit re-reads
+ * the same partial cache forever, so recovery requires moving exits, not
+ * re-requesting.
+ *
+ * `attempt` is deliberately the FIRST parameter: resolveProxyString takes the
+ * raw config first, and a mistaken resolveProxyStringForAttempt(proxyString)
+ * must not silently parse the config as an attempt index and return a route
+ * built from `undefined`.
+ *
+ * Non-sticky Decodo ports and every other provider are returned unrotated —
+ * advancing their port would point at a closed door.
+ */
+function resolveProxyStringForAttempt(attempt = 0, raw = process.env.PROXY_URL || '') {
+  const index = Number.isFinite(Number(attempt)) ? Math.max(0, Math.trunc(Number(attempt))) : 0;
+  const cfg = parseProxyConfigForAttempt(raw, index);
+  if (!cfg) return '';
+  return curlProxyString(cfg);
 }
 
 /**
@@ -308,6 +343,11 @@ function proxyFetch(url, proxyConfig, {
             location: resp.headers.location || '',
             buffer,
             contentType: resp.headers['content-type'] || '',
+            // Additive: callers that only read ok/status/location/buffer/contentType
+            // are unaffected. Rate-limit headers (Retry-After and vendor variants)
+            // are lost forever otherwise, so a 429 that arrives through the tunnel
+            // cannot say how long the lockout lasts (#6241).
+            headers: resp.headers,
           }),
           rejectOnce,
         );
@@ -325,6 +365,7 @@ module.exports = {
   resolveProxyConfig,
   resolveProxyConfigWithFallback,
   resolveProxyString,
+  resolveProxyStringForAttempt,
   resolveProxyStringConnect,
   proxyConnectTunnel,
   proxyFetch,

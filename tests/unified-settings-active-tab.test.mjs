@@ -65,8 +65,11 @@ function extractOpen() {
   // eslint-disable-next-line no-new-func
   return new Function(
     'getEntitlementState',
+    'getEntitlementVerificationStatus',
     'hasFeature',
+    'hasEmbedAccessForAccount',
     'onEntitlementChange',
+    'onEntitlementVerificationChange',
     'onSubscriptionChange',
     'getSubscription',
     'getAuthState',
@@ -75,29 +78,50 @@ function extractOpen() {
     'track',
     'isMobileDevice',
     'overlayHistory',
+    'safeStorageSet',
     `${js}\nreturn __UnifiedSettingsOpenHarness;`,
   );
 }
 
 let mcpAccess = false;
+let embedAccess = false;
+let accountRole = undefined;
 const Harness = extractOpen()(
-  () => ({ planKey: mcpAccess ? 'pro_monthly' : 'free' }),
-  (feature) => feature === 'mcpAccess' && mcpAccess,
+  () => ({ planKey: mcpAccess || embedAccess ? 'pro_monthly' : 'free' }),
+  () => 'ready',
+  (feature) =>
+    (feature === 'mcpAccess' && mcpAccess) || (feature === 'embedAccess' && embedAccess),
+  (role) => role === 'pro' || embedAccess,
+  () => () => {},
   () => () => {},
   () => () => {},
   () => null,
-  () => ({ user: null }),
+  () => ({ user: accountRole ? { role: accountRole } : null }),
   () => {},
   (value) => value,
   () => {},
   () => false,
   { open() {}, replace() {} },
+  () => {},
 );
+
+/**
+ * What the stubbed sourceSelectionSignature() returns, so the baseline open()
+ * records is identifiable rather than merely non-undefined.
+ */
+const STUB_SOURCE_SIGNATURE = 'stub-source-signature';
 
 function makeInstance(initialTab = 'settings') {
   const instance = new Harness();
   instance.activeTab = initialTab;
   instance.resetPanelDraft = () => {};
+  // The real one reads config.getDisabledSources(), which this harness has no
+  // config for. Kept observable rather than a bare no-op so the baseline
+  // open() takes for #6380 stays asserted below.
+  instance.sourceSelectionSignature = () => STUB_SOURCE_SIGNATURE;
+  // Mirrors the real field initializer. open() snapshots only from null, so a
+  // harness left at undefined would model a state the class never has.
+  instance.sourceSelectionBaseline = null;
   instance.renderedTabs = [];
   instance.render = function render() {
     this.renderedTabs.push(this.activeTab);
@@ -106,11 +130,13 @@ function makeInstance(initialTab = 'settings') {
     classList: { add() {} },
     querySelector() { return null; },
   };
+  // Full FocusTrap shape, so extending this harness past open() cannot fail on a
+  // missing method rather than on the behavior under test.
+  instance.focusTrap = { activate() {}, deactivate() {} };
   instance.escapeHandler = () => {};
   instance.unsubscribeEntitlement = null;
+  instance.unsubscribeEntitlementVerification = null;
   instance.unsubscribeSubscription = null;
-  instance.entitlementReady = false;
-  instance.entitlementReadyTimer = null;
   instance.businessSeatsSection = { load() {} };
   return instance;
 }
@@ -118,6 +144,8 @@ function makeInstance(initialTab = 'settings') {
 describe('UnifiedSettings.open active-tab availability (#5611)', () => {
   beforeEach(() => {
     mcpAccess = false;
+    embedAccess = false;
+    accountRole = undefined;
     globalThis.localStorage = {
       getItem: () => null,
       setItem() {},
@@ -160,6 +188,58 @@ describe('UnifiedSettings.open active-tab availability (#5611)', () => {
     assert.deepEqual(instance.renderedTabs, ['mcp-clients']);
   });
 
+  // The Embeds tab is gated on embedAccess, not apiAccess: both Pro tiers are
+  // apiAccess:false, so an apiAccess gate would hide embed keys from the
+  // customers who bought embedding. Same clamp as MCP Clients.
+  it('falls back to Settings when opened to Embeds without embedAccess', () => {
+    const instance = makeInstance();
+
+    instance.open('embeds');
+
+    assert.equal(instance.activeTab, 'settings');
+    assert.deepEqual(instance.renderedTabs, ['settings']);
+  });
+
+  it('clears a sticky Embeds tab when embed access was lost between opens', () => {
+    const instance = makeInstance('embeds');
+
+    instance.open();
+
+    assert.equal(instance.activeTab, 'settings');
+    assert.deepEqual(instance.renderedTabs, ['settings']);
+  });
+
+  it('preserves Embeds when embedAccess is present', () => {
+    embedAccess = true;
+    const instance = makeInstance();
+
+    instance.open('embeds');
+
+    assert.equal(instance.activeTab, 'embeds');
+    assert.deepEqual(instance.renderedTabs, ['embeds']);
+  });
+
+  it('preserves Embeds for a verified Clerk PRO role before entitlement hydration', () => {
+    accountRole = 'pro';
+    const instance = makeInstance();
+
+    instance.open('embeds');
+
+    assert.equal(instance.activeTab, 'embeds');
+    assert.deepEqual(instance.renderedTabs, ['embeds']);
+  });
+
+  // The load-bearing half: a Pro account carries embedAccess without mcpAccess
+  // and vice versa. Neither flag may stand in for the other.
+  it('does not open Embeds on mcpAccess alone', () => {
+    mcpAccess = true;
+    const instance = makeInstance();
+
+    instance.open('embeds');
+
+    assert.equal(instance.activeTab, 'settings');
+  });
+
   it('does not clamp tabs that are always rendered', () => {
     const instance = makeInstance();
 
@@ -167,5 +247,31 @@ describe('UnifiedSettings.open active-tab availability (#5611)', () => {
 
     assert.equal(instance.activeTab, 'api-keys');
     assert.deepEqual(instance.renderedTabs, ['api-keys']);
+  });
+
+  // Sources apply on click with no Save step, and teardownSettings decides
+  // whether to tell the host to reload by comparing against the set as it was
+  // when the overlay opened (#6380). Without that snapshot the comparison has
+  // nothing to compare to and every close either always reloads or never does.
+  it('snapshots the source selection so a change can be detected at close (#6380)', () => {
+    const instance = makeInstance();
+    assert.equal(instance.sourceSelectionBaseline, null);
+
+    instance.open();
+
+    assert.equal(instance.sourceSelectionBaseline, STUB_SOURCE_SIGNATURE);
+  });
+
+  // open() is re-entrant on an already-open overlay. Re-snapshotting there
+  // would adopt a source change made earlier in the session as the baseline,
+  // so close() would see no movement and never ask the host to reload.
+  it('keeps the first snapshot when open() is re-entered mid-session (#6380)', () => {
+    const instance = makeInstance();
+    instance.open();
+    instance.sourceSelectionSignature = () => 'moved-since-open';
+
+    instance.open('api-keys');
+
+    assert.equal(instance.sourceSelectionBaseline, STUB_SOURCE_SIGNATURE);
   });
 });
