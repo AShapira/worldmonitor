@@ -43,7 +43,8 @@ const GIT_LOCAL_ENV_VARS = execFileSync('git', ['rev-parse', '--local-env-vars']
   .split('\n');
 
 function isolatedGitEnv(overrides = {}) {
-  const env = { ...process.env, ...overrides, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
+  // The outer push may target a stacked base; fixtures own their branch graph.
+  const env = { ...process.env, WM_BASE_REF: '', ...overrides, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' };
   for (const name of GIT_LOCAL_ENV_VARS) delete env[name];
   return env;
 }

@@ -25,16 +25,22 @@ find_podman_compose() {
 
 compose() {
   local podman_compose
+  local -a podman_args=()
+  if [[ -n "${WM_CDI_SPEC_DIR:-}" ]]; then
+    podman_args+=("--podman-args=--cdi-spec-dir=${WM_CDI_SPEC_DIR}")
+  fi
   podman_compose="$(find_podman_compose)"
   "${podman_compose}" \
     --env-file "${ENV_FILE}" \
+    -p "${WM_COMPOSE_PROJECT:-worldmonitor}" \
+    "${podman_args[@]}" \
     -f "${BASE_COMPOSE}" \
     -f "${OLLAMA_COMPOSE}" \
     "$@"
 }
 
 compose_up() {
-  if compose up -d; then
+  if compose up -d "$@"; then
     return 0
   fi
 
@@ -45,7 +51,7 @@ compose_up() {
   printf 'Podman start failed; refreshing the user systemd manager and retrying once.\n' >&2
   systemctl --user --machine="${USER}@.host" daemon-reexec
   systemctl --user --machine="${USER}@.host" daemon-reload
-  compose up -d
+  compose up -d "$@"
 }
 
 has_env_key() {
@@ -86,15 +92,21 @@ init_env() {
   append_env VITE_MAP_INTERACTION_MODE 3d
   append_env VITE_PMTILES_URL ""
   append_env OLLAMA_API_URL "http://127.0.0.1:11434"
-  append_env OLLAMA_MODEL "qwen3:14b"
+  append_env OLLAMA_MODEL "qwen3.5:9b"
+  append_env WM_LOCAL_LLM_PROFILE balanced
+  append_env LLM_TOOL_PROVIDER ollama
+  append_env LLM_TOOL_MODEL "qwen3.5:9b"
+  append_env LLM_REASONING_PROVIDER ollama
+  append_env LLM_REASONING_MODEL "qwen3.5:9b"
   append_env LLM_API_URL "http://127.0.0.1:11434/v1/chat/completions"
   append_env LLM_API_KEY ollama
-  append_env LLM_MODEL "qwen3:14b"
+  append_env LLM_MODEL "qwen3.5:9b"
   append_env LLM_REASONING_EFFORT none
   append_env YAHOO_USER_AGENT worldmonitor-local/1.0
   append_env GROQ_API_KEY ""
   append_env OPENROUTER_API_KEY ""
-  append_env OLLAMA_CONTEXT_LENGTH 8192
+  append_env WM_LOCAL_LLM_MODEL_DIGEST "$(jq -r .modelDigest "${PROJECT_DIR}/deploy/local-llm-lock.json")"
+  append_env OLLAMA_CONTEXT_LENGTH 16384
   append_env OLLAMA_NUM_PARALLEL 2
   append_env OLLAMA_MAX_LOADED_MODELS 1
   append_env OLLAMA_KEEP_ALIVE 24h
@@ -110,10 +122,48 @@ env_value() {
   sed -n "s/^${key}=//p" "${ENV_FILE}" | tail -n 1
 }
 
+migrate_model_env() {
+  [[ -f "${ENV_FILE}" ]] || init_env
+  local backup backup_dir
+  backup_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/worldmonitor/env-backups"
+  install -d -m 700 "${backup_dir}"
+  backup="$(mktemp "${backup_dir}/$(basename "${PROJECT_DIR}").env.backup-qwen35.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  (umask 077; cp -p "${ENV_FILE}" "${backup}")
+  local key value
+  while IFS='=' read -r key value; do
+    if has_env_key "${key}"; then
+      sed -i "s|^${key}=.*|${key}=${value}|" "${ENV_FILE}"
+    else
+      append_env "${key}" "${value}"
+    fi
+  done <<'MODEL_SETTINGS'
+OLLAMA_MODEL=qwen3.5:9b
+LLM_MODEL=qwen3.5:9b
+WM_LOCAL_LLM_PROFILE=balanced
+LLM_TOOL_PROVIDER=ollama
+LLM_TOOL_MODEL=qwen3.5:9b
+LLM_REASONING_PROVIDER=ollama
+LLM_REASONING_MODEL=qwen3.5:9b
+LLM_REASONING_EFFORT=none
+OLLAMA_CONTEXT_LENGTH=16384
+OLLAMA_NUM_PARALLEL=2
+OLLAMA_MAX_LOADED_MODELS=1
+MODEL_SETTINGS
+  local digest
+  digest="$(jq -r .modelDigest "${PROJECT_DIR}/deploy/local-llm-lock.json")"
+  if has_env_key WM_LOCAL_LLM_MODEL_DIGEST; then
+    sed -i "s|^WM_LOCAL_LLM_MODEL_DIGEST=.*|WM_LOCAL_LLM_MODEL_DIGEST=${digest}|" "${ENV_FILE}"
+  else
+    append_env WM_LOCAL_LLM_MODEL_DIGEST "${digest}"
+  fi
+  chmod 600 "${ENV_FILE}" "${backup}"
+  printf 'Updated local model settings; backup: %s\n' "${backup}"
+}
+
 model_name() {
   local model
   model="$(env_value OLLAMA_MODEL)"
-  printf '%s\n' "${model:-qwen3:14b}"
+  printf '%s\n' "${model:-qwen3.5:9b}"
 }
 
 worldmonitor_api_key() {
@@ -140,9 +190,20 @@ wait_for_url() {
   return 1
 }
 
+verify_model_digest() {
+  local model expected
+  model="$(model_name)"
+  [[ "${model}" == qwen3.5:9b ]] || return 0
+  expected="$(jq -r '.modelDigest' "${PROJECT_DIR}/deploy/local-llm-lock.json")"
+  curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags \
+    | jq -e --arg model "${model}" --arg digest "${expected}" \
+      '.models | any(.name == $model and .digest == $digest and .details.quantization_level == "Q4_K_M")' >/dev/null
+}
+
 pull_model() {
   wait_for_url http://127.0.0.1:11434/api/tags 90
   podman exec worldmonitor-ollama ollama pull "$(model_name)"
+  verify_model_digest
 }
 
 preload_model() {
@@ -163,6 +224,7 @@ verify_stack() {
 
   wait_for_url http://127.0.0.1:11434/api/tags 30
   wait_for_url http://127.0.0.1:3000/api/sidecar-health 60
+  verify_model_digest
 
   curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags \
     | jq -e --arg model "${model}" '.models | any(.name == $model or .model == $model)' >/dev/null
@@ -220,6 +282,7 @@ Usage: scripts/podman-local.sh COMMAND
 
 Commands:
   init             Generate missing ignored .env settings and secrets
+  migrate-model    Back up .env and select Qwen3.5 9B balanced local inference
   config           Validate the merged Compose configuration
   build            Build the World Monitor and relay images
   up               Start the stack without rebuilding
@@ -243,6 +306,9 @@ case "${command_name}" in
   init)
     init_env
     ;;
+  migrate-model)
+    migrate_model_env
+    ;;
   config)
     init_env
     compose config >/dev/null
@@ -254,7 +320,7 @@ case "${command_name}" in
     ;;
   up)
     init_env
-    compose_up
+    compose_up "$@"
     ;;
   deploy)
     init_env
@@ -275,7 +341,7 @@ case "${command_name}" in
     init_env
     compose config >/dev/null
     compose down
-    compose_up
+    compose_up "$@"
     ;;
   status)
     compose ps
@@ -292,7 +358,7 @@ case "${command_name}" in
     ;;
   seed)
     cd "${PROJECT_DIR}"
-    ./scripts/run-seeders.sh
+    flock -n "${XDG_RUNTIME_DIR:-/tmp}/worldmonitor-seeders-${UID}.lock" ./scripts/run-seeders.sh
     ;;
   verify)
     verify_stack

@@ -7,6 +7,7 @@ import type {
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { sha256Hex } from './_shared';
 import { callLlmReasoning } from '../../../_shared/llm';
+import { isLocalLlmProfile, localLlmCacheTag, localLlmOptions } from '../../../../scripts/_local-llm-profile.mjs';
 // Issue #3724 (extension): prediction-market titles flow into the deduction
 // LLM's prompt. Use the semantic + structural sanitizer, not the lighter
 // sanitizeHeadline, so that a compromised market feed cannot inject
@@ -127,7 +128,7 @@ export async function deductSituation(
         : '';
 
     const predictionHash = predictionContext ? (await sha256Hex(predictionContext)).slice(0, 8) : '';
-    const cacheKey = `deduct:situation:v2:${queryHash.slice(0, 16)}${frameworkHash ? ':fw' + frameworkHash : ''}${predictionHash ? ':pm' + predictionHash : ''}`;
+    const cacheKey = `deduct:situation:v2:${queryHash.slice(0, 16)}${frameworkHash ? ':fw' + frameworkHash : ''}${predictionHash ? ':pm' + predictionHash : ''}${localLlmCacheTag()}`;
 
     const { mode, systemPrompt, userPrompt } = buildDeductionPrompt({ query, geoContext, predictionContext });
 
@@ -145,6 +146,7 @@ export async function deductSituation(
                 timeoutMs: DEDUCT_TIMEOUT_MS,
                 stage: 'deduct-situation',
                 systemAppend: framework || undefined,
+                ...localLlmOptions(true),
             });
 
             if (!result) return null;
@@ -155,7 +157,7 @@ export async function deductSituation(
         // Cache safety net must sit above the LLM's own timeout so the
         // caller's bound wins; otherwise the inflight wrapper rejects at
         // the 30s default before callLlmReasoning can complete (#3539).
-        { timeoutMs: DEDUCT_TIMEOUT_MS + 5_000 },
+        isLocalLlmProfile() ? { timeoutMs: 95_000 } : { timeoutMs: DEDUCT_TIMEOUT_MS + 5_000 },
     );
 
     if (!cached?.analysis) {

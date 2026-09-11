@@ -4,6 +4,7 @@ import { getMarketWatchlistEntries } from './market-watchlist';
 import type { SummarizationResult } from './summarization';
 import { effectivePubDateMs } from './feed-date';
 import { withTimeout } from '@/utils/with-timeout';
+import { localLlmBrowserCacheTag } from './local-llm-profile';
 
 /**
  * Upper bound on the LLM summarization step. The full chain
@@ -202,7 +203,7 @@ function sanitizeCacheKeyPart(value: string): string {
 }
 
 function getCacheKey(timezone: string): string {
-  return `${CACHE_PREFIX}:${sanitizeCacheKeyPart(resolveTimeZone(timezone))}`;
+  return `${CACHE_PREFIX}:${sanitizeCacheKeyPart(resolveTimeZone(timezone))}${localLlmBrowserCacheTag()}`;
 }
 
 function isMeaningfulToken(token: string): boolean {

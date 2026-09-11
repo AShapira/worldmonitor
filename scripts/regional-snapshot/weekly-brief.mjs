@@ -12,6 +12,7 @@
 //
 // Same provider chain + injectable-callLlm pattern as narrative.mjs.
 
+import { isLocalLlmProfile, callLocalLlm } from '../_local-llm-profile.mjs';
 import { extractFirstJsonObject, cleanJsonText } from '../_llm-json.mjs';
 import { buildLlmCallEvent, emitLlmEvents } from '../lib/llm-telemetry.cjs';
 import {
@@ -258,6 +259,12 @@ export function parseBriefJson(text) {
 export async function callLlmDefault({ systemPrompt, userPrompt }, opts = {}) {
   const validate = opts.validate;
   const briefFetch = weeklyBriefFetchForTests || ((...args) => globalThis.fetch(...args));
+  if (isLocalLlmProfile()) {
+    return callLocalLlm({
+      systemPrompt, userPrompt, maxTokens: BRIEF_MAX_TOKENS, temperature: 0.3, report: true,
+      timeoutMs: opts.callBudgetMs, validate, fetch: briefFetch,
+    });
+  }
   // llm_call telemetry (#4944 U5): one event per provider attempt, unified
   // with the Vercel-side stream via scripts/lib/llm-telemetry.cjs.
   const promptChars = (systemPrompt?.length ?? 0) + (userPrompt?.length ?? 0);

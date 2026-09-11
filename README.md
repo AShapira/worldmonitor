@@ -29,7 +29,10 @@ npm ci
 systemctl --user enable --now worldmonitor-podman.service worldmonitor-seeders.timer
 ```
 
-Open <http://127.0.0.1:3000>. The default model is `qwen3:14b`; both native
+For the selected model, report budgets, migration and rollback, see
+[Local Qwen3.5 deployment](docs/local-qwen35-deployment.md).
+
+Open <http://127.0.0.1:3000>. The default model is `qwen3.5:9b`; both native
 Ollama and OpenAI-compatible World Monitor routes remain local. Generated
 secrets are stored only in the ignored, mode-`0600` `.env` file. The dashboard,
 Ollama, and Redis REST proxy bind to loopback; Redis and the AIS relay remain

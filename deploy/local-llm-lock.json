@@ -1,0 +1,7 @@
+{
+  "model": "qwen3.5:9b",
+  "quantization": "Q4_K_M",
+  "modelDigest": "6488c96fa5faab64bb65cbd30d4289e20e6130ef535a93ef9a49f42eda893ea7",
+  "ollamaVersion": "0.34.0",
+  "ollamaImage": "docker.io/ollama/ollama@sha256:684d8674b4315fa18f4f0e973a118ec2652ed96f67563277839985175858e0ba"
+}

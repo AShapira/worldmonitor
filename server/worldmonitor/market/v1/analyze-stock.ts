@@ -9,7 +9,8 @@ import type {
   ServerContext,
   StockAnalysisHeadline,
 } from '../../../../src/generated/server/worldmonitor/market/v1/service_server';
-import { callLlm } from '../../../_shared/llm';
+import { callLlm, callLlmReasoning } from '../../../_shared/llm';
+import { isLocalLlmProfile, localLlmCacheTag, localLlmOptions } from '../../../../scripts/_local-llm-profile.mjs';
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { yahooGate } from '../../../_shared/constants';
 import { UPSTREAM_TIMEOUT_MS, sanitizeSymbol } from './_shared';
@@ -1648,7 +1649,7 @@ async function buildAiOverlay(
     ratingSignal,
   );
   const hasFundamentals = Object.values(fundamentals).some((v) => typeof v === 'number');
-  const llm = await callLlm({
+  const llm = await (isLocalLlmProfile() ? callLlmReasoning : callLlm)({
     messages: [
       {
         role: 'system',
@@ -1702,6 +1703,7 @@ async function buildAiOverlay(
     timeoutMs: 20_000,
     stage: 'analyze-stock',
     providerOrder: ['openrouter', 'generic'],
+    ...localLlmOptions(true),
     validate: (content) => {
       try {
         const parsed = JSON.parse(content) as Record<string, unknown>;
@@ -1991,7 +1993,7 @@ export async function analyzeStock(
   // v7 -> v8: expose the fundamentals-blended rating through the additive
   // ratingSignal field while preserving the legacy technical signal/signalScore
   // pair for already-loaded web, desktop, and API clients.
-  const cacheKey = `market:analyze-stock:v8:${symbol}:${includeNews ? 'news' : 'no-news'}${nameSuffix}`;
+  const cacheKey = `market:analyze-stock:v8:${symbol}:${includeNews ? 'news' : 'no-news'}${nameSuffix}${localLlmCacheTag()}`;
 
   const fetchFreshAnalysis = async (): Promise<AnalyzeStockResponse | null> => {
     const [history, analystData] = await Promise.all([
@@ -2067,8 +2069,9 @@ export async function analyzeStock(
         // Worst-case fetcher budget: 2× UPSTREAM_TIMEOUT_MS sequenced (10s+10s for
         // history/analyst then headlines/dividend) + 20s LLM overlay + small
         // overhead. 60s safely sits above this so the cache safety net (#3539)
-        // doesn't pre-empt the caller's own per-stage timeouts.
-        timeoutMs: 60_000,
+        // doesn't pre-empt the caller's own per-stage timeouts. The local
+        // profile permits a 90s overlay, so its enclosing budget is 120s.
+        timeoutMs: isLocalLlmProfile() ? 120_000 : 60_000,
       });
 
   if (cached) return cached;

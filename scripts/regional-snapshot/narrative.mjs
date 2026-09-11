@@ -15,11 +15,12 @@
 //     the evidence IDs already computed by collectEvidence(). Unknown IDs
 //     are silently filtered so a halluci­nated ID never leaks through.
 //   - Provider chain mirrors seed-insights.mjs / seed-forecasts.mjs:
-//     Groq → OpenRouter (Gemini Flash). Ollama skipped: the narrative call
-//     runs on Railway which has no local model.
+//     Hosted providers on Railway; the explicit balanced local profile
+//     uses Ollama only, including validation retries.
 //   - `callLlm` is dependency-injected so unit tests can exercise the full
 //     prompt + parser without network.
 
+import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from '../_local-llm-profile.mjs';
 import { createHash } from 'node:crypto';
 
 import { extractFirstJsonObject, cleanJsonText } from '../_llm-json.mjs';
@@ -304,6 +305,16 @@ export function parseNarrativeJson(text, validEvidenceIds) {
     return { narrative: emptyNarrative(), valid: false };
   }
 
+  // Local generation must retry invented citations, rather than silently
+  // dropping them and publishing prose without its claimed evidence.
+  if (isLocalLlmProfile()) {
+    const sections = [...Object.values(parsed), ...(Array.isArray(parsed.watch_items) ? parsed.watch_items : [])];
+    if (sections.some((section) => Array.isArray(section?.evidence_ids)
+      && section.evidence_ids.some((id) => !validSet.has(id)))) {
+      return { narrative: emptyNarrative(), valid: false };
+    }
+  }
+
   const p = /** @type {Record<string, unknown>} */ (parsed);
   const watch = Array.isArray(p.watch_items)
     ? p.watch_items.slice(0, MAX_WATCH_ITEMS).map((w) => coerceSection(w, validSet))
@@ -353,6 +364,12 @@ export function parseNarrativeJson(text, validEvidenceIds) {
 export async function callLlmDefault({ systemPrompt, userPrompt }, opts = {}) {
   const validate = opts.validate;
   const narrativeFetch = narrativeFetchForTests || ((...args) => globalThis.fetch(...args));
+  if (isLocalLlmProfile()) {
+    return callLocalLlm({
+      systemPrompt, userPrompt, maxTokens: 900, temperature: 0.3, report: true,
+      timeoutMs: opts.callBudgetMs, validate, fetch: narrativeFetch,
+    });
+  }
   const callBudgetMs = Number.isFinite(opts.callBudgetMs)
     ? Math.max(0, Math.floor(opts.callBudgetMs))
     : NARRATIVE_LLM_CALL_BUDGET_MS;
@@ -504,10 +521,11 @@ export async function generateRegionalNarrative(region, snapshot, evidence, opts
   // prompt's only volatile input is a day-granular date, so identical world
   // state within a day hashes to the same key.
   const promptText = typeof prompt === 'string' ? prompt : JSON.stringify(prompt);
-  const cacheKey = `${NARRATIVE_CACHE_PREFIX}${region.id}:${createHash('sha256').update(promptText).digest('hex').slice(0, 16)}`;
+  const cacheKey = `${NARRATIVE_CACHE_PREFIX}${region.id}:${createHash('sha256').update(localLlmCacheTag() + promptText).digest('hex').slice(0, 16)}`;
   try {
     const hit = await cache.get(cacheKey);
-    if (hit && typeof hit === 'object' && hit.narrative && typeof hit.narrative === 'object') {
+    if (hit && typeof hit === 'object' && hit.narrative && typeof hit.narrative === 'object'
+      && (!isLocalLlmProfile() || parseNarrativeJson(JSON.stringify(hit.narrative), validEvidenceIds).valid)) {
       console.log(`[narrative] ${region.id}: prompt-hash cache hit, skipping LLM`);
       return { narrative: hit.narrative, provider: 'cache', model: typeof hit.model === 'string' ? hit.model : '' };
     }

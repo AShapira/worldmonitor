@@ -309,6 +309,15 @@ export function resolveIdentifier(src, name, scope = {}, opts = {}) {
 }
 
 export function resolveExpr(src, expr, scope = {}, opts = {}) {
+  // A local profile may increase budgets beyond Railway's container ceiling.
+  // Resolve only the known imported predicate, never execute arbitrary code.
+  // Unspecified callers inspect the hosted configuration; gates can explicitly
+  // inspect the local branch with localProfile:true.
+  const profileBudget = String(expr).trim().match(/^isLocalLlmProfile\(\)\s*\?\s*([^?:]+)\s*:\s*([^?:]+)$/);
+  if (profileBudget) {
+    if (!hasNamedImportBinding(src, { moduleSpecifier: './_local-llm-profile.mjs', importedName: 'isLocalLlmProfile' })) return null;
+    return resolveExpr(src, profileBudget[opts.localProfile === true ? 1 : 2].trim(), scope, opts);
+  }
   const direct = safeEval(expr, { ...PRESEEDED, ...scope });
   if (direct != null) return direct;
   if (/^\w+$/.test(expr)) return resolveIdentifier(src, expr, scope, opts);

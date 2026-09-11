@@ -329,7 +329,7 @@ describe('runner dispatch', () => {
         env: {
           ...process.env,
           PATH: `${dir}:${process.env.PATH}`,
-          ...(concurrency ? { WM_PREPUSH_TEST_CONCURRENCY: concurrency } : {}),
+          WM_PREPUSH_TEST_CONCURRENCY: concurrency || '2',
         },
       });
     } catch (err) {

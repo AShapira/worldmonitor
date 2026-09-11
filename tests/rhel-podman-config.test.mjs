@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -15,6 +15,33 @@ const root = resolve(import.meta.dirname, '..');
 const read = (path) => readFileSync(resolve(root, path), 'utf8');
 
 describe('Podman environment upgrades', () => {
+  it('explicit model migration preserves credentials and saves a protected rollback copy', () => {
+    const fixture = mkdtempSync(resolve(tmpdir(), 'wm-qwen35-migrate-'));
+    try {
+      mkdirSync(resolve(fixture, 'scripts'));
+      copyFileSync(resolve(root, 'scripts/podman-local.sh'), resolve(fixture, 'scripts/podman-local.sh'));
+      mkdirSync(resolve(fixture, 'deploy'));
+      copyFileSync(resolve(root, 'deploy/local-llm-lock.json'), resolve(fixture, 'deploy/local-llm-lock.json'));
+      const original = 'OLLAMA_MODEL=qwen3:14b\nLLM_MODEL=qwen3:14b\nREDIS_TOKEN=fixture-token\n';
+      writeFileSync(resolve(fixture, '.env'), original, { mode: 0o600 });
+      const state = resolve(fixture, 'state');
+      execFileSync('bash', [resolve(fixture, 'scripts/podman-local.sh'), 'migrate-model'], { env: { ...process.env, XDG_STATE_HOME: state } });
+      const env = parseEnv(readFileSync(resolve(fixture, '.env'), 'utf8'));
+      assert.equal(env.OLLAMA_MODEL, 'qwen3.5:9b');
+      assert.equal(env.LLM_MODEL, 'qwen3.5:9b');
+      assert.equal(env.WM_LOCAL_LLM_PROFILE, 'balanced');
+      assert.equal(env.OLLAMA_CONTEXT_LENGTH, '16384');
+      assert.equal(env.REDIS_TOKEN, 'fixture-token');
+      assert.equal(env.WM_LOCAL_LLM_MODEL_DIGEST, JSON.parse(readFileSync(resolve(root, 'deploy/local-llm-lock.json'), 'utf8')).modelDigest);
+      const backupDir = resolve(state, 'worldmonitor/env-backups');
+      const backups = readdirSync(backupDir);
+      assert.ok(!readdirSync(fixture).some(name => name.includes('backup-qwen35')), 'no plaintext env dumps in checkout root');
+      assert.equal(backups.length, 1);
+      assert.equal(readFileSync(resolve(backupDir, backups[0]), 'utf8'), original);
+      assert.equal(statSync(resolve(backupDir, backups[0])).mode & 0o777, 0o600);
+    } finally { rmSync(fixture, { recursive: true, force: true }); }
+  });
+
   it('the relay requests usable Qwen classifications instead of reasoning-only completions', async () => {
     let requestBody;
     const server = http.createServer(async (req, res) => {
@@ -57,6 +84,8 @@ describe('Podman environment upgrades', () => {
       try {
         mkdirSync(resolve(fixture, 'scripts'));
         copyFileSync(resolve(root, 'scripts/podman-local.sh'), resolve(fixture, 'scripts/podman-local.sh'));
+      mkdirSync(resolve(fixture, 'deploy'));
+      copyFileSync(resolve(root, 'deploy/local-llm-lock.json'), resolve(fixture, 'deploy/local-llm-lock.json'));
         const original = 'OLLAMA_MODEL=custom-model\nWORLDMONITOR_API_KEY=wm_fixture_operator\nREDIS_TOKEN=fixture-redis-token\n';
         writeFileSync(resolve(fixture, '.env'), original, { mode: 0o600 });
         // Model Compose's required-secret check before any build/start/stop.

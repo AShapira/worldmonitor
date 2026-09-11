@@ -144,7 +144,7 @@ describe('redis-rest-proxy command gate', () => {
     // without the pinned-script branch runCommand enforces.
     assert.match(proxySrc, /client\.sendCommand\(commandForExecution\(args\)\)/,
       'runCommand must delegate to the shared command gate');
-    assert.match(proxySrc, /multi\.sendCommand\(commandForExecution\(cmd\)\)/,
+    assert.match(proxySrc, /multi\.addCommand\(commandForExecution\(cmd\)\)/,
       'the /multi-exec handler must delegate to the shared command gate');
     assert.doesNotMatch(proxySrc, /if \(!ALLOWED_COMMANDS\.has\(cmdName\)\)/,
       '/multi-exec must not re-implement the allowlist check');

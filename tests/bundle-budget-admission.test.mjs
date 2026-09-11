@@ -63,7 +63,7 @@ const RAILWAY_CONTAINER_CAP_MS = 600_000;
  * value: a section this gate cannot read is a section it cannot vouch for,
  * and silently dropping it would turn the guard into a false pass.
  */
-function readBudgetedBundles() {
+function readBudgetedBundles({ localProfile = false } = {}) {
   const budgeted = [];
   let sawMaxBundleMsLiteral = 0;
 
@@ -103,7 +103,7 @@ function readBudgetedBundles() {
       + `${(src.match(/maxBundleMs:/g) || []).length}. The gate cannot tell which one runBundle receives.`,
     );
 
-    const maxBundleMs = resolveExpr(src, budgetExpr, {}, { file: bundlePath });
+    const maxBundleMs = resolveExpr(src, budgetExpr, {}, { file: bundlePath, localProfile });
     assert.ok(
       Number.isFinite(maxBundleMs) && maxBundleMs > 0,
       `${name}: maxBundleMs expression "${budgetExpr}" did not resolve to a positive number. `
@@ -114,7 +114,7 @@ function readBudgetedBundles() {
     // maxBundleMs 900_000 would satisfy every per-section assertion below and
     // still be hard-killed by Railway at 10 minutes, mid-publish.
     assert.ok(
-      maxBundleMs < RAILWAY_CONTAINER_CAP_MS,
+      localProfile || maxBundleMs < RAILWAY_CONTAINER_CAP_MS,
       `${name}: maxBundleMs ${maxBundleMs}ms is at or above Railway's ${RAILWAY_CONTAINER_CAP_MS}ms container kill. `
       + 'The container dies before the budget is reached, so the budget shapes nothing.',
     );
@@ -146,7 +146,7 @@ function readBudgetedBundles() {
       sections: sections.map((section) => {
         const timeoutMs = section.timeoutMsExpr == null
           ? DEFAULT_SECTION_TIMEOUT_MS                 // runBundle's own fallback
-          : resolveExpr(src, section.timeoutMsExpr, {}, { file: bundlePath });
+          : resolveExpr(src, section.timeoutMsExpr, {}, { file: bundlePath, localProfile });
         assert.ok(
           Number.isFinite(timeoutMs) && timeoutMs > 0,
           `${name} / ${section.label}: timeoutMs expression "${section.timeoutMsExpr}" did not resolve to a positive number.`,
@@ -444,4 +444,21 @@ test('#6449: static-ref-heavy claims durable turns per invocation, not calendar-
   // The turn is only ever advanced by the acknowledgement hook, which a deferred
   // tick never reaches — that is what preserves rotation fairness.
   assert.match(bundleSource, /onTerminalComplete: async \(\) => \{[\s\S]*acknowledgeStaticRefHeavyTurn\(turnClaim\)/);
+});
+
+
+test('local profile budgets admit every section without changing hosted Railway caps', () => {
+  const bundles = readBudgetedBundles({ localProfile: true });
+  for (const bundle of bundles) {
+    for (const section of bundle.sections) {
+      assert.ok(section.worstCaseMs + ADMISSION_HEADROOM_MS <= bundle.maxBundleMs,
+        `${bundle.name}/${section.label} cannot fit the local bundle budget`);
+    }
+  }
+  const local = bundles.find(bundle => bundle.name === 'seed-bundle-derived-signals.mjs');
+  const hosted = readBudgetedBundles().find(bundle => bundle.name === local.name);
+  assert.equal(local.maxBundleMs, 1_200_000);
+  assert.equal(local.sections.find(section => section.label === 'Regional-Snapshots').timeoutMs, 900_000);
+  assert.equal(hosted.maxBundleMs, 570_000);
+  assert.equal(hosted.sections.find(section => section.label === 'Regional-Snapshots').timeoutMs, 180_000);
 });
