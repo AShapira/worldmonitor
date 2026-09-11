@@ -8,7 +8,8 @@ import type {
 import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 import { displayNameForIso2 } from '../../../_shared/country-normalize';
 import { UPSTREAM_TIMEOUT_MS, TIER1_COUNTRIES, sha256Hex } from './_shared';
-import { callLlm } from '../../../_shared/llm';
+import { callLlm, callLlmReasoning } from '../../../_shared/llm';
+import { isLocalLlmProfile, localLlmCacheTag, localLlmOptions } from '../../../../scripts/_local-llm-profile.mjs';
 import { verifyCitationIndexes, checkLeadGrounding } from '../../../../shared/brief-llm-core.js';
 import { isCallerPremium } from '../../../_shared/premium-check';
 import { sanitizeForPrompt } from '../../../_shared/llm-sanitize.js';
@@ -176,7 +177,7 @@ export async function getCountryIntelBrief(
     frameworkHash: frameworkRaw ? frameworkHashFull.slice(0, 8) : '',
     energyYear,
     energyImportYear,
-  });
+  }) + localLlmCacheTag();
   const countryCode = req.countryCode.toUpperCase();
   const countryName = TIER1_COUNTRIES[countryCode]
     || displayNameForIso2(countryCode)
@@ -249,7 +250,7 @@ Rules:
         userPromptParts.push(`Context snapshot:\n${promptContext}`);
       }
 
-      const llmResult = await callLlm({
+      const llmResult = await (isLocalLlmProfile() ? callLlmReasoning : callLlm)({
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPromptParts.join('\n\n') },
@@ -259,6 +260,10 @@ Rules:
         timeoutMs: UPSTREAM_TIMEOUT_MS,
         systemAppend: frameworkRaw || undefined,
         stage: 'country-intel-brief',
+        ...localLlmOptions(true),
+        ...(isLocalLlmProfile() ? {
+          validate: (content: string) => verifyCitationIndexes(content, entrySources.length).stripped === 0,
+        } : {}),
       });
 
       if (!llmResult) return null;
@@ -294,7 +299,7 @@ Rules:
         generatedAt: Date.now(),
         sources: entrySources,
       };
-    });
+    }, undefined, isLocalLlmProfile() ? { timeoutMs: 100_000 } : undefined);
   } catch {
     return empty;
   }

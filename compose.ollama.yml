@@ -3,12 +3,15 @@
 
 services:
   worldmonitor:
+    image: "${WM_LOCAL_IMAGE:-worldmonitor:latest}"
     build:
       args:
         VITE_VARIANT: "${VITE_VARIANT:-full}"
         VITE_MAP_INTERACTION_MODE: "${VITE_MAP_INTERACTION_MODE:-3d}"
         VITE_PMTILES_URL: "${VITE_PMTILES_URL:-}"
         VITE_LOCAL_OPERATOR_MODE: "1"
+        VITE_LOCAL_LLM_PROFILE: "balanced"
+        VITE_LOCAL_LLM_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
     environment:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?RELAY_SHARED_SECRET required}"
       # Operator-issued local key for authenticated/premium API handlers. The
@@ -18,12 +21,19 @@ services:
       WORLDMONITOR_RELAY_KEY: "${WORLDMONITOR_RELAY_KEY:?WORLDMONITOR_RELAY_KEY required}"
       # Native Ollama is first in the normal provider chain.
       OLLAMA_API_URL: "http://ollama:11434"
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:14b}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
+      WM_LOCAL_LLM_PROFILE: "balanced"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
+      WM_LOCAL_LLM_MODEL_DIGEST: "${WM_LOCAL_LLM_MODEL_DIGEST:-}"
+      LLM_TOOL_PROVIDER: "ollama"
+      LLM_TOOL_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
+      LLM_REASONING_PROVIDER: "ollama"
+      LLM_REASONING_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
       # The generic route covers handlers that explicitly omit the native
       # Ollama provider (notably stock analysis). Ollama ignores the API key.
       LLM_API_URL: "http://ollama:11434/v1/chat/completions"
       LLM_API_KEY: "${LLM_API_KEY:-ollama}"
-      LLM_MODEL: "${LLM_MODEL:-qwen3:14b}"
+      LLM_MODEL: "${LLM_MODEL:-qwen3.5:9b}"
       LLM_REASONING_EFFORT: "${LLM_REASONING_EFFORT:-none}"
       YAHOO_USER_AGENT: "${YAHOO_USER_AGENT:-worldmonitor-local/1.0}"
       GROQ_API_KEY: ""
@@ -33,6 +43,7 @@ services:
         condition: service_started
 
   ais-relay:
+    image: "${WM_LOCAL_RELAY_IMAGE:-worldmonitor-ais-relay:latest}"
     environment:
       # Host seeders use 127.0.0.1:3000 in .env; the relay must reach the
       # application through container DNS, never its own loopback address.
@@ -40,7 +51,14 @@ services:
       RELAY_SHARED_SECRET: "${RELAY_SHARED_SECRET:?RELAY_SHARED_SECRET required}"
       WORLDMONITOR_RELAY_KEY: "${WORLDMONITOR_RELAY_KEY:?WORLDMONITOR_RELAY_KEY required}"
       OLLAMA_API_URL: "http://ollama:11434"
-      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3:14b}"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
+      WM_LOCAL_LLM_PROFILE: "balanced"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
+      WM_LOCAL_LLM_MODEL_DIGEST: "${WM_LOCAL_LLM_MODEL_DIGEST:-}"
+      LLM_TOOL_PROVIDER: "ollama"
+      LLM_TOOL_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
+      LLM_REASONING_PROVIDER: "ollama"
+      LLM_REASONING_MODEL: "${OLLAMA_MODEL:-qwen3.5:9b}"
       LLM_REASONING_EFFORT: "${LLM_REASONING_EFFORT:-none}"
       GROQ_API_KEY: ""
       OPENROUTER_API_KEY: ""
@@ -48,8 +66,11 @@ services:
       ollama:
         condition: service_started
 
+  redis-rest:
+    image: "${WM_LOCAL_REDIS_REST_IMAGE:-worldmonitor-redis-rest:latest}"
+
   ollama:
-    image: "docker.io/ollama/ollama@sha256:4dea9fb511947e24a84237bb636b0203abcb2ff0d3fbc7b4ff865deb91362131"
+    image: "docker.io/ollama/ollama@sha256:684d8674b4315fa18f4f0e973a118ec2652ed96f67563277839985175858e0ba"
     container_name: worldmonitor-ollama
     devices:
       - "nvidia.com/gpu=all"
@@ -57,7 +78,7 @@ services:
       - "127.0.0.1:11434:11434"
     environment:
       OLLAMA_HOST: "0.0.0.0:11434"
-      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-8192}"
+      OLLAMA_CONTEXT_LENGTH: "${OLLAMA_CONTEXT_LENGTH:-16384}"
       OLLAMA_NUM_PARALLEL: "${OLLAMA_NUM_PARALLEL:-2}"
       OLLAMA_MAX_LOADED_MODELS: "${OLLAMA_MAX_LOADED_MODELS:-1}"
       OLLAMA_KEEP_ALIVE: "${OLLAMA_KEEP_ALIVE:-24h}"

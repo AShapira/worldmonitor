@@ -92,6 +92,8 @@ const SERVER_OR_PROVIDER_SECRET_ENV_NAMES = [
 const CLIENT_ENV_ALLOWLIST = new Set([
   // Public UI presence flag only; nginx retains the actual operator credential.
   'VITE_LOCAL_OPERATOR_MODE',
+  'VITE_LOCAL_LLM_PROFILE',
+  'VITE_LOCAL_LLM_MODEL',
   'VITE_CLERK_PUBLISHABLE_KEY',
   'VITE_CLOUD_PREFS_ENABLED',
   'VITE_CONVEX_URL',

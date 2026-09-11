@@ -7,6 +7,7 @@ import type {
 import filterParamContracts from '../../../../shared/openapi-filter-param-contracts.json';
 import { CACHE_VERSION } from '../../../../src/utils/summary-cache-key';
 import { getCachedJson } from '../../../_shared/redis';
+import { localLlmCacheTag } from '../../../../scripts/_local-llm-profile.mjs';
 import { markNoCacheResponse } from '../../../_shared/response-headers';
 
 const CACHE_KEY_PATTERN = new RegExp(filterParamContracts.newsSummarizeArticleCacheKeyPattern);
@@ -51,7 +52,7 @@ export async function getSummarizeArticleCache(
   }
 
   try {
-    const cached = await getCachedJson(cacheKey);
+    const cached = await getCachedJson(cacheKey + localLlmCacheTag());
 
     if (cached === NEG_SENTINEL || cached === null || cached === undefined) {
       markNoCacheResponse(ctx.request);

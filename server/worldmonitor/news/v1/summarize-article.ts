@@ -25,6 +25,7 @@ import {
   setResponseHeader,
 } from '../../../_shared/response-headers';
 import { stripThinkingTags } from '../../../_shared/llm';
+import { isLocalLlmProfile, localLlmCacheTag } from '../../../../scripts/_local-llm-profile.mjs';
 import { buildLlmCallEvent, deliverUsageEvents } from '../../../_shared/usage';
 
 // Best-effort llm_call telemetry (#4895). This handler bypasses callLlm (the
@@ -159,7 +160,7 @@ export async function summarizeArticle(
     openrouter: 'OPENROUTER_API_KEY not configured',
   };
 
-  const credentials = getProviderCredentials(provider);
+  const credentials = isLocalLlmProfile() && provider !== 'ollama' ? null : getProviderCredentials(provider);
   if (!credentials) {
     return {
       summary: '',
@@ -170,7 +171,9 @@ export async function summarizeArticle(
       error: '',
       errorType: '',
       status: 'SUMMARIZE_STATUS_SKIPPED',
-      statusDetail: skipReasons[provider] || `Unknown provider: ${provider}`,
+      statusDetail: isLocalLlmProfile() && provider !== 'ollama'
+        ? 'Cloud inference is disabled by the local balanced profile'
+        : skipReasons[provider] || `Unknown provider: ${provider}`,
     };
   }
 
@@ -192,7 +195,7 @@ export async function summarizeArticle(
   }
 
   try {
-    const cacheKey = await getCacheKey(headlines, mode, sanitizedGeoContext, variant, lang, systemAppend || undefined, bodies);
+    const cacheKey = await getCacheKey(headlines, mode, sanitizedGeoContext, variant, lang, systemAppend || undefined, bodies) + localLlmCacheTag();
 
     // Single atomic call — source tracking happens inside cachedFetchJsonWithMeta,
     // eliminating the TOCTOU race between a separate getCachedJson and cachedFetchJson.
@@ -307,6 +310,8 @@ export async function summarizeArticle(
         recordModelSuccess(apiUrl, model);
 
         const data = await response.json() as any;
+        // A token-limited local completion may be syntactically plausible but incomplete.
+        if (isLocalLlmProfile() && ['length', 'max_tokens', 'max_output_tokens'].includes(data.choices?.[0]?.finish_reason)) return null;
         const tokens = (data.usage?.total_tokens as number) || 0;
         const usage = data.usage as { total_tokens?: number; prompt_tokens?: number; completion_tokens?: number } | undefined;
         const message = data.choices?.[0]?.message;

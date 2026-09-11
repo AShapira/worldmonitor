@@ -2,6 +2,7 @@
 // @ts-check
 /// <reference path="./seed-forecasts.types.d.ts" />
 
+import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from './_local-llm-profile.mjs';
 import crypto from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { loadEnvFile, runSeed, CHROME_UA, withRetry, parseRetryAfterMs, getResponseHeader, isRetryableHttpStatus } from './_seed-utils.mjs';
@@ -14924,11 +14925,20 @@ const FORECAST_LLM_STAGE_BUDGET_GUARD_MS = 5_000;
 // tests/forecast-llm-flash-routing-and-timeout pins that invariant.
 const FORECAST_SEED_LOCK_TTL_MS = 240_000;
 const FORECAST_LLM_RUN_BUDGET_MS = 200_000;
+
+export function getForecastRunBudgets() {
+  // Local reports share one GPU and run sequentially. Keep the lease longer
+  // than the whole run, including the market-implications afterPublish tail.
+  return isLocalLlmProfile()
+    ? { runBudgetMs: 30 * 60_000, lockTtlMs: 31 * 60_000 }
+    : { runBudgetMs: FORECAST_LLM_RUN_BUDGET_MS, lockTtlMs: FORECAST_SEED_LOCK_TTL_MS };
+}
+
 // Anchored at the start of the direct seed run; null in tests and the deep-forecast
 // worker (separate entry/lock) so only the per-stage budget applies there.
 let forecastLlmRunDeadlineMs = null;
 
-function beginForecastLlmRunBudget(runBudgetMs = FORECAST_LLM_RUN_BUDGET_MS) {
+function beginForecastLlmRunBudget(runBudgetMs = getForecastRunBudgets().runBudgetMs) {
   forecastLlmRunDeadlineMs = Number.isFinite(runBudgetMs) && runBudgetMs > 0
     ? Date.now() + Math.floor(runBudgetMs)
     : null;
@@ -14966,6 +14976,7 @@ function migrateLegacyGlobalProviderOrder(providerOrder) {
 }
 
 function getForecastLlmCallOptions(stage = 'default') {
+  if (isLocalLlmProfile()) return { providerOrder: ['ollama'], modelOverrides: { ollama: process.env.OLLAMA_MODEL || process.env.LLM_MODEL || 'qwen3.5:9b' } };
   const defaultProviderOrder = FORECAST_LLM_PROVIDERS.map(provider => provider.name);
   const globalProviderOrder = parseForecastProviderOrder(process.env.FORECAST_LLM_PROVIDER_ORDER);
   // Production carries the historical global `openrouter,groq` value. Migrate
@@ -15036,6 +15047,10 @@ function getForecastLlmCallOptions(stage = 'default') {
 }
 
 function resolveForecastLlmProviders(options = {}) {
+  if (isLocalLlmProfile()) return [{
+    name: 'ollama', envKey: 'OLLAMA_API_URL',
+    model: process.env.OLLAMA_MODEL || process.env.LLM_MODEL || 'qwen3.5:9b', timeout: 90_000,
+  }];
   const requestedOrder = Array.isArray(options.providerOrder) && options.providerOrder.length > 0
     ? options.providerOrder
     : FORECAST_LLM_PROVIDERS.map(provider => provider.name);
@@ -15107,6 +15122,7 @@ function resolveForecastLlmProviders(options = {}) {
 // (self-host / last-resort). Changing LLM_MODEL then misses the old key
 // instead of serving stale frames into state-derived probabilities.
 function buildCriticalSignalRouteTag(options = {}) {
+  if (isLocalLlmProfile()) return localLlmCacheTag();
   const pinTag = [
     (options.providerOrder || []).join('-') || 'default',
     options.modelOverrides?.openrouter || 'table',
@@ -15467,6 +15483,22 @@ async function callForecastLLM(systemPrompt, userPrompt, options = {}) {
     return await forecastLlmCallOverrideForTests(systemPrompt, userPrompt, options);
   }
   const stage = options.stage || 'default';
+  if (isLocalLlmProfile()) {
+    const report = stage !== 'critical_signals';
+    const remaining = Math.min(getRemainingForecastLlmRunBudgetMs(),
+      Number.isFinite(options.stageBudgetMs) ? options.stageBudgetMs : (report ? 90_000 : 25_000));
+    if (remaining <= 0) return createForecastLlmFailureResult(options, FORECAST_LLM_FAILURE_BUDGET_EXHAUSTED);
+    const result = await callLocalLlm({
+      systemPrompt, userPrompt, report, maxTokens: options.maxTokens,
+      temperature: options.temperature, deadlineMs: Date.now() + remaining,
+      fetch: forecastLlmFetchForTests || ((...args) => globalThis.fetch(...args)),
+      validate: (text) => {
+        try { const parsed = JSON.parse(cleanJsonText(text)); return parsed !== null && typeof parsed === 'object'; }
+        catch { return false; }
+      },
+    });
+    return result ?? createForecastLlmFailureResult(options, FORECAST_LLM_FAILURE_PROVIDER_FAILED);
+  }
   const providers = resolveForecastLlmProviders(options);
   const stageBudgetMs = getForecastLlmStageBudgetMs(options);
   const budgetStartedAtMs = Date.now();
@@ -15688,7 +15720,7 @@ async function redisSet(url, token, key, data, ttlSeconds) {
 // new key.
 function buildNarrativeCacheHash(systemPrompt, userPrompt) {
   return crypto.createHash('sha256')
-    .update(`${systemPrompt}\u0000${userPrompt}`)
+    .update(`${localLlmCacheTag()}${systemPrompt}\u0000${userPrompt}`)
     .digest('hex').slice(0, 16);
 }
 
@@ -17402,6 +17434,7 @@ const MARKET_IMPLICATIONS_STAGE_CACHE_PREFIX = 'forecast:llm-market-implications
 // that chain needs (no over-skip); a chain with NO runnable providers reserves just the guard,
 // so a genuine no-key outage is admitted and surfaces SEED_ERROR instead of hiding as a starve.
 function getMarketImplicationsMinRunBudgetMs(llmOptions = {}) {
+  if (isLocalLlmProfile()) return 90_000;
   const runnable = resolveForecastLlmProviders(llmOptions).filter((provider) => process.env[provider.envKey]);
   const chainMs = runnable.reduce((sum, provider) => sum + (provider.timeout || 0), 0);
   return chainMs + FORECAST_LLM_STAGE_BUDGET_GUARD_MS;
@@ -17421,7 +17454,7 @@ function buildMarketImplicationsFingerprint(context) {
     const n = Number(match);
     return Number.isFinite(n) && n !== 0 ? Number(n).toPrecision(1) : '0';
   });
-  return crypto.createHash('sha256').update(quantized).digest('hex').slice(0, 16);
+  return crypto.createHash('sha256').update(localLlmCacheTag() + quantized).digest('hex').slice(0, 16);
 }
 
 function marketImplicationsMetaErrorReason(reason) {
@@ -17803,7 +17836,7 @@ if (_isDirectRun) {
     };
   }, {
     ttlSeconds: TTL_SECONDS,
-    lockTtlMs: FORECAST_SEED_LOCK_TTL_MS,
+    lockTtlMs: getForecastRunBudgets().lockTtlMs,
     validateFn: (data) => Array.isArray(data?.predictions) && data.predictions.length > 0,
     declareRecords,
     sourceVersion: 'detectors+llm-pipeline',

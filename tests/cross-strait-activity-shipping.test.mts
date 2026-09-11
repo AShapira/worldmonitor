@@ -7,7 +7,7 @@ import test from 'node:test';
 import { __testing__ } from '../api/health.js';
 import seedHealthHandler from '../api/seed-health.js';
 import { atomicPublish, runSeed } from '../scripts/_seed-utils.mjs';
-import { readSectionFreshness } from '../scripts/_bundle-runner.mjs';
+import { readSectionFreshness, sectionWorstCaseMs, ADMISSION_HEADROOM_MS } from '../scripts/_bundle-runner.mjs';
 import { extractRunBundleSectionSource } from './helpers/bundle-section-parser.mjs';
 import {
   CROSS_STRAIT_ACTIVITY_KEY,
@@ -246,6 +246,7 @@ test('MND metadata counts completed source attempts independently of canonical p
   assert.ok(sectionSource);
   const section = runInNewContext(`(${sectionSource})`, {
     MIN: minute, HOUR: 60 * minute, CHINA_DECISION_SIGNALS_KEY: 'unused-in-this-test',
+    isLocalLlmProfile: () => false,
   }).find(section => section.label === 'Cross-Strait-Activity');
   assert.equal(section?.sourceRetryMetaKey, metaKey);
   assert.equal(section?.sourceRetryDelayMs, 30 * minute);
@@ -811,7 +812,26 @@ test('cross-Strait shipping budgets preserve Railway cleanup headroom', () => {
       CROSS_STRAIT_ACTIVITY_FETCH_PHASE_TIMEOUT_MS + CROSS_STRAIT_ACTIVITY_PUBLISH_CLEANUP_HEADROOM_MS
     ),
   );
-  assert.match(read('scripts/seed-bundle-derived-signals.mjs'), /maxBundleMs:\s*570_000/);
+  const source = read('scripts/seed-bundle-derived-signals.mjs');
+  const sectionsSource = extractRunBundleSectionSource(source, 'derived-signals');
+  const budgetExpression = source.match(/maxBundleMs:\s*([^,\n]+)/)?.[1];
+  assert.ok(sectionsSource);
+  assert.ok(budgetExpression);
+  for (const local of [false, true]) {
+    const fixture = {
+      MIN: 60_000, HOUR: 3_600_000, CHINA_DECISION_SIGNALS_KEY: 'unused-in-this-test',
+      isLocalLlmProfile: () => local,
+    };
+    const budget = runInNewContext(`(${budgetExpression})`, fixture);
+    const sections = runInNewContext(`(${sectionsSource})`, fixture);
+    assert.equal(budget, local ? 1_200_000 : 570_000);
+    const regional = sections.find(section => section.label === 'Regional-Snapshots');
+    assert.equal(regional?.timeoutMs, local ? 900_000 : 180_000);
+    for (const section of sections) {
+      assert.ok(sectionWorstCaseMs(section) + ADMISSION_HEADROOM_MS <= budget,
+        `${local ? 'local' : 'hosted'} ${section.label} must preserve cleanup headroom`);
+    }
+  }
   assert.match(
     read('scripts/seed-bundle-derived-signals.mjs'),
     new RegExp(`seedMetaKey:\\s*'${CROSS_STRAIT_ACTIVITY_COMPLETION_META_KEY.replace('seed-meta:', '')}'`),

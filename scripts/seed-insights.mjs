@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from './_local-llm-profile.mjs';
 import {
   loadEnvFile,
   CHROME_UA,
@@ -500,6 +501,15 @@ async function callLLM(headline, options = {}) {
   const maxTokens = Number.isFinite(options.maxTokens) ? options.maxTokens : 300;
 
   const insightsFetch = insightsLlmFetchForTests || ((...args) => globalThis.fetch(...args));
+  if (isLocalLlmProfile()) {
+    return callLocalLlm({
+      systemPrompt, userPrompt, maxTokens, temperature: INSIGHTS_LLM_TEMPERATURE,
+      report: Boolean(options.systemPrompt), timeoutMs: options.callBudgetMs,
+      fetch: insightsFetch,
+      validate: (text) => text.length >= 20 && (!options.accept || Boolean(options.accept(text))),
+    });
+  }
+
   const callBudgetMs = Number.isFinite(options.callBudgetMs)
     ? Math.max(0, Math.floor(options.callBudgetMs))
     : INSIGHTS_LLM_CALL_BUDGET_MS;
@@ -1013,7 +1023,7 @@ async function fetchInsights() {
   const synthesisUser = synthesisUserPrompt(topStories, {
     includeMemberTitles: promptMemberTitlesEnabled,
   });
-  const storiesSignature = insightsSynthesisSignature(synthesisSystem, synthesisUser);
+  const storiesSignature = insightsSynthesisSignature(localLlmCacheTag() + synthesisSystem, synthesisUser);
   const synthesisBreakerOpen = hasBriefCluster && shouldSkipInsightsSynthesis({
     previousMeta: previousFreshnessMeta,
     synthesisSignature: storiesSignature,
@@ -1097,7 +1107,7 @@ async function fetchInsights() {
       + 'falling back to single-headline brief',
     );
     const legacy = await generateLegacySingleHeadlineBrief(topStories, {
-      callBudgetMs: Math.max(0, INSIGHTS_LLM_CALL_BUDGET_MS - (Date.now() - llmRunStartedAtMs)),
+      callBudgetMs: Math.max(0, (isLocalLlmProfile() ? 90_000 : INSIGHTS_LLM_CALL_BUDGET_MS) - (Date.now() - llmRunStartedAtMs)),
     });
     worldBrief = legacy.worldBrief;
     briefProvider = legacy.briefProvider;

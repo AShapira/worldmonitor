@@ -34,6 +34,7 @@
 //     the grounding validator after the May 12 hallucination — see
 //     generateDigestProse header comment.
 
+import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from '../_local-llm-profile.mjs';
 import { createHash } from 'node:crypto';
 
 import {
@@ -128,6 +129,18 @@ const WHY_MATTERS_CONCURRENCY = 5;
 // across environments instead of drifting to the groq fallback.
 const BRIEF_LLM_ALLOWED_PROVIDERS = ['openrouter'];
 
+async function callBriefLlm(deps, systemPrompt, userPrompt, options) {
+  if (!isLocalLlmProfile()) return deps.callLLM(systemPrompt, userPrompt, options);
+  const report = options.stage === 'brief-digest-cron';
+  const result = await callLocalLlm({
+    systemPrompt, userPrompt, report, maxTokens: options.maxTokens,
+    temperature: options.temperature, timeoutMs: report ? 90_000 : options.timeoutMs,
+    validate: options.validate,
+  });
+  return result?.text ?? null;
+}
+
+
 // ── whyMatters (per story) ─────────────────────────────────────────────────
 // The pure helpers (`WHY_MATTERS_SYSTEM`, `buildWhyMattersUserPrompt` (aliased
 // to `buildWhyMattersPrompt` for backcompat), `parseWhyMatters`, `hashBriefStory`)
@@ -177,7 +190,7 @@ export async function generateWhyMatters(story, deps) {
   // longer multi-sentence output. Trust the wire shape; only reject an
   // obviously-bad payload (empty, stub
   // echo, incomplete sentence, or length outside either parser's bounds).
-  if (typeof deps.callAnalystWhyMatters === 'function') {
+  if (!isLocalLlmProfile() && typeof deps.callAnalystWhyMatters === 'function') {
     try {
       const analystOut = await deps.callAnalystWhyMatters(story);
       const normalized = normalizeAnalystWhyMatters(analystOut);
@@ -209,7 +222,8 @@ export async function generateWhyMatters(story, deps) {
   // two prompt contracts never cross-contaminate in the write direction.
   const storyHash = await hashBriefStory(story);
   try {
-    const v10 = await deps.cacheGet(`brief:llm:whymatters:v10:${storyHash}`);
+    // Local explanations have their own prompt and provenance namespace.
+    const v10 = isLocalLlmProfile() ? null : await deps.cacheGet(`brief:llm:whymatters:v10:${storyHash}`);
     if (v10 && typeof v10 === 'object') {
       const normalized = normalizeAnalystWhyMatters(v10.whyMatters);
       if (normalized) return normalized;
@@ -236,7 +250,7 @@ export async function generateWhyMatters(story, deps) {
   // provider chain rejected finish_reason=length, so an abbreviation-ending
   // token clip could be cached as an apparently complete sentence. The old
   // rows carry no completion metadata and cannot be distinguished safely.
-  const key = `brief:llm:whymatters:v6:${storyHash}`;
+  const key = `brief:llm:whymatters:v6:${localLlmCacheTag()}${storyHash}`;
   try {
     const hit = await deps.cacheGet(key);
     const parsedHit = parseWhyMatters(hit);
@@ -248,12 +262,13 @@ export async function generateWhyMatters(story, deps) {
   const { system, user } = buildWhyMattersPrompt(sanitizeStoryForPrompt(story));
   let text = null;
   try {
-    text = await deps.callLLM(system, user, {
+    text = await callBriefLlm(deps, system, user, {
       maxTokens: 120,
       temperature: 0.4,
       timeoutMs: 10_000,
       allowedProviders: BRIEF_LLM_ALLOWED_PROVIDERS,
       stage: 'brief-whymatters-cron',
+      ...(isLocalLlmProfile() ? { validate: (text) => Boolean(parseWhyMatters(text)) } : {}),
     });
   } catch {
     return null;
@@ -378,7 +393,7 @@ export async function generateStoryDescription(story, deps) {
   // into the hash material — same story-shape change as whymatters
   // v4→v5. Pre-PR every category was 'General'; post-PR carries the
   // per-story Title-Cased EventCategory. Bump invalidates v2 entries.
-  const key = `brief:llm:description:v3:${await hashBriefStory(story)}`;
+  const key = `brief:llm:description:v3:${localLlmCacheTag()}${await hashBriefStory(story)}`;
   try {
     const hit = await deps.cacheGet(key);
     if (typeof hit === 'string') {
@@ -395,12 +410,13 @@ export async function generateStoryDescription(story, deps) {
   const { system, user } = buildStoryDescriptionPrompt(sanitizeStoryForDescriptionPrompt(story));
   let text = null;
   try {
-    text = await deps.callLLM(system, user, {
+    text = await callBriefLlm(deps, system, user, {
       maxTokens: 140,
       temperature: 0.4,
       timeoutMs: 10_000,
       allowedProviders: BRIEF_LLM_ALLOWED_PROVIDERS,
       stage: 'brief-description-cron',
+      ...(isLocalLlmProfile() ? { validate: (text) => Boolean(parseStoryDescription(text, story.headline)) } : {}),
     });
   } catch {
     return null;
@@ -639,6 +655,11 @@ export function validateDigestProseShape(obj, stories) {
   // capped to 16 chars (the prompt emits 8). Length capped to
   // MAX_STORIES_PER_USER × 2 to bound prompt drift.
   const rawRanked = Array.isArray(obj.rankedStoryHashes) ? obj.rankedStoryHashes : [];
+  if (isLocalLlmProfile() && Array.isArray(stories)) {
+    const knownHashes = new Set(stories.slice(0, MAX_STORIES_PER_USER).map((story, index) =>
+      typeof story.hash === 'string' && story.hash.length >= 8 ? story.hash.slice(0, 8) : `p${index + 1}`));
+    if (rawRanked.some((hash) => typeof hash !== 'string' || !knownHashes.has(hash.trim()))) return null;
+  }
   const rankedStoryHashes = rawRanked
     .filter((x) => typeof x === 'string')
     .map((x) => x.trim().slice(0, 16))
@@ -795,7 +816,7 @@ export async function generateDigestProse(userId, stories, sensitivity, deps, ct
   // model to lead with ONE primary story when two top stories aren't
   // substantively linked. v7 cache rows would otherwise serve stitched
   // leads for the full 4h TTL. Prompt content change → cache invalidation.
-  const key = `brief:llm:digest:v8:${hashDigestInput(userId, stories, sensitivity, ctx)}`;
+  const key = `brief:llm:digest:v8:${localLlmCacheTag()}${hashDigestInput(userId, stories, sensitivity, ctx)}`;
   try {
     const hit = await deps.cacheGet(key);
     // CRITICAL: re-run the shape+grounding validator on cache hits.
@@ -813,12 +834,13 @@ export async function generateDigestProse(userId, stories, sensitivity, deps, ct
   const { system, user } = buildDigestPrompt(stories, sensitivity, ctx);
   let text = null;
   try {
-    text = await deps.callLLM(system, user, {
+    text = await callBriefLlm(deps, system, user, {
       maxTokens: 900,
       temperature: 0.4,
       timeoutMs: 15_000,
       allowedProviders: BRIEF_LLM_ALLOWED_PROVIDERS,
       stage: 'brief-digest-cron',
+      ...(isLocalLlmProfile() ? { validate: (text) => Boolean(parseDigestProse(text, stories)) } : {}),
     });
   } catch (err) {
     // LLM-side failure (timeout, provider down, network). Distinct
@@ -953,11 +975,12 @@ export async function enrichBriefEnvelopeWithLLM(envelope, rule, deps, opts = {}
 
   // Per-story enrichment — whyMatters AND description in parallel
   // per story (two LLM calls) but bounded across stories.
-  const enrichedStories = await mapLimit(stories, WHY_MATTERS_CONCURRENCY, async (story) => {
-    const [why, desc] = await Promise.all([
-      generateWhyMatters(story, deps),
-      generateStoryDescription(story, deps),
-    ]);
+  const enrichedStories = await mapLimit(stories, isLocalLlmProfile() ? 1 : WHY_MATTERS_CONCURRENCY, async (story) => {
+    // Submit sequentially on the local GPU so ten short tasks do not spend
+    // their entire ten-second generation deadline waiting in the queue.
+    const [why, desc] = isLocalLlmProfile()
+      ? [await generateWhyMatters(story, deps), await generateStoryDescription(story, deps)]
+      : await Promise.all([generateWhyMatters(story, deps), generateStoryDescription(story, deps)]);
     if (!why && !desc) return story;
     return {
       ...story,

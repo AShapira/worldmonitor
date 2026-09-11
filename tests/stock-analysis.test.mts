@@ -116,6 +116,7 @@ afterEach(() => {
   delete process.env.OPENROUTER_API_KEY;
   delete process.env.OLLAMA_API_URL;
   delete process.env.OLLAMA_MODEL;
+  delete process.env.WM_LOCAL_LLM_PROFILE;
   delete process.env.LLM_API_URL;
   delete process.env.LLM_API_KEY;
   delete process.env.LLM_MODEL;
@@ -1025,5 +1026,40 @@ describe('analyzeStock fundamental scoring wiring', () => {
     assert.equal(response.ratingSummary, response.summary);
     assert.equal(response.ratingAction, response.action);
     assert.equal(response.ratingConfidence, response.confidence);
+  });
+});
+
+
+describe('balanced local stock analysis', () => {
+  it('retries malformed local JSON without cloud inference or changes to calculated scores', async () => {
+    process.env.WM_LOCAL_LLM_PROFILE = 'balanced';
+    process.env.OLLAMA_API_URL = 'http://localhost:11434';
+    process.env.OLLAMA_MODEL = 'qwen3.5:9b';
+    process.env.OPENROUTER_API_KEY = 'must-not-be-used';
+    const attempts: Array<Record<string, any>> = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (url.includes('finance.yahoo.com/v8/finance/chart')) return Response.json(mockChartPayload);
+      if (url.includes('finance.yahoo.com/v10/finance/quoteSummary')) return Response.json(mockQuoteSummaryPayload);
+      if (url.includes('news.google.com')) return new Response(mockNewsXml);
+      assert.equal(url, 'http://localhost:11434/v1/chat/completions');
+      attempts.push(JSON.parse(String(init?.body)));
+      const narrative = { summary: 'Supplied ratios remain mixed.', action: 'Watch the supplied signals.' };
+      return Response.json({ choices: [{ finish_reason: 'stop', message: { content: attempts.length === 1
+        ? '{invalid json'
+        : JSON.stringify({ technical: narrative, rating: narrative, newsSentiment: 0.2 }) } }] });
+    }) as typeof fetch;
+    const result = await analyzeStock({} as never, { symbol: 'BABA', name: 'Alibaba', includeNews: true });
+    assert.equal(result.provider, 'ollama');
+    assert.equal(result.model, 'qwen3.5:9b');
+    assert.equal(result.fundamentals?.debtToEquity, 1.5);
+    assert.equal(result.fundamentals?.financialCurrency, 'CNY');
+    assert.equal(result.newsSentiment, 0.2);
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[0].think, true);
+    assert.equal(attempts[1].think, false);
+    const input = JSON.parse(attempts[0].messages[1].content);
+    assert.equal(result.signalScore, input.technical.signalScore);
+    assert.equal(result.compositeScore, input.rating.compositeScore);
   });
 });

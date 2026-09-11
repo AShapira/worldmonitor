@@ -1,3 +1,4 @@
+import { callLocalLlm, isLocalLlmProfile } from '../../scripts/_local-llm-profile.mjs';
 import { CHROME_UA } from './constants';
 import { isModelUsable, isProviderAvailable, recordModelFailure, recordModelSuccess } from './llm-health';
 import { sanitizeForPrompt } from './llm-sanitize.js';
@@ -106,7 +107,7 @@ export function getProviderCredentials(
       // Recent Ollama releases expose both controls. `reasoning_effort` is
       // required by the OpenAI-compatible route for Qwen 3; `think` remains
       // useful for older Ollama/model combinations.
-      extraBody: { think: false, reasoning_effort: 'none' },
+      extraBody: { think: isLocalLlmProfile() && Boolean(overrides.enableReasoning), reasoning_effort: isLocalLlmProfile() && overrides.enableReasoning ? 'medium' : 'none' },
     };
   }
 
@@ -168,7 +169,7 @@ export function getProviderCredentials(
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      extraBody: reasoningEffort ? { reasoning_effort: reasoningEffort } : undefined,
+      extraBody: isLocalLlmProfile() ? { think: Boolean(overrides.enableReasoning), reasoning_effort: overrides.enableReasoning ? 'medium' : 'none' } : reasoningEffort ? { reasoning_effort: reasoningEffort } : undefined,
     };
   }
 
@@ -379,6 +380,26 @@ export type LlmStreamOptions = Omit<LlmCallOptions, 'stripThinkingTags' | 'valid
  * Returns null if no provider is available.
  */
 export function callLlmReasoningStream(opts: LlmStreamOptions): ReadableStream<Uint8Array> {
+  if (isLocalLlmProfile()) {
+    const abort = new AbortController();
+    const encoder = new TextEncoder();
+    let cancelled = false;
+    return new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const messages = opts.messages.map((m, i) => i === 0 && m.role === 'system' && opts.systemAppend
+          ? { ...m, content: `${m.content}\n\n---\n\n${sanitizeForPrompt(opts.systemAppend)}` } : m);
+        const result = await callLocalLlm({ ...opts, messages, report: true, background: false,
+          signal: opts.signal ? AbortSignal.any([opts.signal, abort.signal]) : abort.signal });
+        if (cancelled) return;
+        const emit = (value: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
+        if (result) { emit({ delta: result.text }); emit({ done: true }); }
+        else emit({ error: 'llm_unavailable' });
+        controller.close();
+      },
+      cancel() { cancelled = true; abort.abort(); },
+    });
+  }
+
   const envProvider = process.env.LLM_REASONING_PROVIDER;
   const provider = (envProvider && PROVIDER_SET.has(envProvider) ? envProvider : 'openrouter') as LlmProviderName;
   const model = process.env.LLM_REASONING_MODEL;
@@ -603,6 +624,21 @@ export async function callLlm(opts: LlmCallOptions): Promise<LlmCallResult | nul
         ...messages.slice(1),
       ];
     }
+  }
+
+  if (isLocalLlmProfile()) {
+    const started = Date.now();
+    const result = await callLocalLlm({
+      messages, maxTokens, temperature, timeoutMs, report: enableReasoning,
+      validate, background: false,
+    });
+    await flushLlmEvents([buildLlmCallEvent({
+      provider: 'ollama', model: result?.model || process.env.OLLAMA_MODEL || 'qwen3.5:9b',
+      stage: opts.stage || 'unknown', ok: Boolean(result), durationMs: Date.now() - started,
+      promptChars: promptChars(messages), maxTokens, fallbackIndex: 0,
+      tokensTotal: result?.tokens || 0,
+    })]);
+    return result ? { content: result.text, model: result.model, provider: result.provider, tokens: result.tokens, finishReason: result.finishReason } : null;
   }
 
   const providers = resolveProviderChain({ forcedProvider, providerOrder });

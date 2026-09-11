@@ -810,7 +810,7 @@ const server = http.createServer(async (req, res) => {
       const multi = client.multi();
       for (const cmd of commands) {
         try {
-          multi.sendCommand(commandForExecution(cmd));
+          multi.addCommand(commandForExecution(cmd));
         } catch (err) {
           res.writeHead(403);
           res.end(JSON.stringify({ error: err.message }));

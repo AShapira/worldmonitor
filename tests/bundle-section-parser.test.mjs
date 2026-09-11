@@ -447,3 +447,14 @@ test('extractBundleOption requires a word boundary before the key', () => {
   const real = '], { maxBundleMs: 570_000 });';
   assert.equal(extractBundleOption(real, 'maxBundleMs'), '570_000');
 });
+
+
+test('profile duration ternaries resolve both branches only for the declared local helper import', () => {
+  const src = "import { isLocalLlmProfile } from './_local-llm-profile.mjs';";
+  const expr = 'isLocalLlmProfile() ? 1_200_000 : 570_000';
+  assert.equal(resolveExpr(src, expr), 570_000);
+  assert.equal(resolveExpr(src, expr, {}, {localProfile:true}), 1_200_000);
+  assert.equal(resolveExpr('', expr), null);
+  assert.equal(resolveExpr("import { isLocalLlmProfile } from './untrusted.mjs';", expr), null);
+  assert.equal(resolveExpr(src, 'unknownFunction() ? 900_000 : 180_000'), null);
+});

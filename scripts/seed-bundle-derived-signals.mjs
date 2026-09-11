@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { isLocalLlmProfile } from './_local-llm-profile.mjs';
 import { runBundle, MIN, HOUR } from './_bundle-runner.mjs';
 import { CHINA_DECISION_SIGNALS_KEY } from './seed-china-decision-signals.mjs';
 
@@ -14,9 +15,9 @@ await runBundle('derived-signals', [
   // seeder would have run with no degradation.
   { label: 'Cross-Strait-Activity', script: 'seed-cross-strait-activity.mjs', seedMetaKey: 'military:cross-strait-activity:complete', sourceRetryMetaKey: 'seed-meta:military:cross-strait-activity:taiwan-mnd', sourceRetryDelayMs: 30 * MIN, intervalMs: 3 * HOUR, timeoutMs: 300_000, requiredEnv: [['JAPAN_MOD_PROXY_URL', 'PROXY_URL']] },
   { label: 'China-Decision-Signals', script: 'seed-china-decision-signals.mjs', seedMetaKey: 'intelligence:china-decision-signals', canonicalKey: CHINA_DECISION_SIGNALS_KEY, completionMetaKey: 'seed-completion:intelligence:china-decision-signals', intervalMs: 15 * MIN, timeoutMs: 90_000 },
-  { label: 'Regional-Snapshots', script: 'seed-regional-snapshots.mjs', seedMetaKey: 'intelligence:regional-snapshots', intervalMs: 6 * HOUR, timeoutMs: 180_000 },
+  { label: 'Regional-Snapshots', script: 'seed-regional-snapshots.mjs', seedMetaKey: 'intelligence:regional-snapshots', intervalMs: 6 * HOUR, timeoutMs: isLocalLlmProfile() ? 900_000 : 180_000 },
 ], {
   // Railway kills cron containers at 10 minutes. Defer sections whose full
   // timeout plus SIGTERM/SIGKILL grace cannot fit, preserving completed work.
-  maxBundleMs: 570_000,
+  maxBundleMs: isLocalLlmProfile() ? 1_200_000 : 570_000,
 });

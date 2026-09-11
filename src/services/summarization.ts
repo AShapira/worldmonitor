@@ -8,6 +8,7 @@
  */
 
 import { mlWorker } from './ml-worker';
+import { isLocalLlmBrowserProfile, localLlmBrowserCacheTag } from './local-llm-profile';
 import { getRpcBaseUrl, getRpcErrorStatusCode } from '@/services/rpc-client';
 import { SITE_VARIANT } from '@/config';
 import { BETA_MODE } from '@/config/beta';
@@ -128,6 +129,7 @@ async function tryApiProvider(
   lang?: string,
   bodies?: string[],
 ): Promise<SummarizationResult | null> {
+  if (isLocalLlmBrowserProfile() && providerDef.provider !== 'ollama') return null;
   if (!isFeatureAvailable(providerDef.featureId)) return null;
   // Entitlement/suppression gate BEFORE any network dispatch (#4913) — a
   // denial returns null so the chain falls through to browser T5.
@@ -295,7 +297,7 @@ export async function generateSummary(
   const optionsSuffix = options?.skipCloudProviders || options?.skipBrowserFallback
     ? `:opts${options.skipCloudProviders ? 'C' : ''}${options.skipBrowserFallback ? 'B' : ''}`
     : '';
-  const cacheKey = (await buildSummaryCacheKey(headlines, 'brief', geoContext, SITE_VARIANT, lang, undefined, bodies)) + optionsSuffix;
+  const cacheKey = (await buildSummaryCacheKey(headlines, 'brief', geoContext, SITE_VARIANT, lang, undefined, bodies)) + optionsSuffix + localLlmBrowserCacheTag();
 
   return summaryResultBreaker.execute(
     async () => {
@@ -339,7 +341,7 @@ async function generateSummaryInternal(
     } catch { /* cache lookup failed — proceed to provider chain */ }
   }
 
-  if (BETA_MODE) {
+  if (BETA_MODE && !isLocalLlmBrowserProfile()) {
     const modelReady = mlWorker.isAvailable && mlWorker.isModelLoaded('summarization-beta');
 
     if (modelReady) {
