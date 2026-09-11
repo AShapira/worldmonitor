@@ -124,8 +124,10 @@ env_value() {
 
 migrate_model_env() {
   [[ -f "${ENV_FILE}" ]] || init_env
-  local backup
-  backup="$(mktemp "${ENV_FILE}.backup-qwen35.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
+  local backup backup_dir
+  backup_dir="${XDG_STATE_HOME:-${HOME}/.local/state}/worldmonitor/env-backups"
+  install -d -m 700 "${backup_dir}"
+  backup="$(mktemp "${backup_dir}/$(basename "${PROJECT_DIR}").env.backup-qwen35.$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")"
   (umask 077; cp -p "${ENV_FILE}" "${backup}")
   local key value
   while IFS='=' read -r key value; do

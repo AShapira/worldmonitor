@@ -24,7 +24,8 @@ describe('Podman environment upgrades', () => {
       copyFileSync(resolve(root, 'deploy/local-llm-lock.json'), resolve(fixture, 'deploy/local-llm-lock.json'));
       const original = 'OLLAMA_MODEL=qwen3:14b\nLLM_MODEL=qwen3:14b\nREDIS_TOKEN=fixture-token\n';
       writeFileSync(resolve(fixture, '.env'), original, { mode: 0o600 });
-      execFileSync('bash', [resolve(fixture, 'scripts/podman-local.sh'), 'migrate-model']);
+      const state = resolve(fixture, 'state');
+      execFileSync('bash', [resolve(fixture, 'scripts/podman-local.sh'), 'migrate-model'], { env: { ...process.env, XDG_STATE_HOME: state } });
       const env = parseEnv(readFileSync(resolve(fixture, '.env'), 'utf8'));
       assert.equal(env.OLLAMA_MODEL, 'qwen3.5:9b');
       assert.equal(env.LLM_MODEL, 'qwen3.5:9b');
@@ -32,10 +33,12 @@ describe('Podman environment upgrades', () => {
       assert.equal(env.OLLAMA_CONTEXT_LENGTH, '16384');
       assert.equal(env.REDIS_TOKEN, 'fixture-token');
       assert.equal(env.WM_LOCAL_LLM_MODEL_DIGEST, JSON.parse(readFileSync(resolve(root, 'deploy/local-llm-lock.json'), 'utf8')).modelDigest);
-      const backups = readdirSync(fixture).filter(name => name.startsWith('.env.backup-qwen35.'));
+      const backupDir = resolve(state, 'worldmonitor/env-backups');
+      const backups = readdirSync(backupDir);
+      assert.ok(!readdirSync(fixture).some(name => name.includes('backup-qwen35')), 'no plaintext env dumps in checkout root');
       assert.equal(backups.length, 1);
-      assert.equal(readFileSync(resolve(fixture, backups[0]), 'utf8'), original);
-      assert.equal(statSync(resolve(fixture, backups[0])).mode & 0o777, 0o600);
+      assert.equal(readFileSync(resolve(backupDir, backups[0]), 'utf8'), original);
+      assert.equal(statSync(resolve(backupDir, backups[0])).mode & 0o777, 0o600);
     } finally { rmSync(fixture, { recursive: true, force: true }); }
   });
 

@@ -49,8 +49,8 @@ scripts/podman-local.sh preload
 scripts/podman-local.sh verify
 ```
 
-`migrate-model` backs up `.env` as an ignored mode-0600 `.env.backup-qwen35.*`
-file and explicitly updates both model routes and the balanced profile. Normal
+`migrate-model` backs up `.env` as a mode-0600 file beneath
+`${XDG_STATE_HOME:-$HOME/.local/state}/worldmonitor/env-backups/` and explicitly updates both model routes and the balanced profile. Normal
 `init` still preserves existing operator choices. The Compose project is
 `worldmonitor`, independent of the checkout directory, preserving named volumes.
 Use `WM_COMPOSE_PROJECT` for a separately isolated deployment.
