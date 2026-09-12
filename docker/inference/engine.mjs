@@ -141,7 +141,7 @@ export class InferenceEngine {
     } catch (error) {
       if (job.status !== 'cancelled') {
         job.status = 'failed';
-        job.error = controller.signal.aborted ? 'Report deadline exceeded. Retry explicitly.' : (job.providerError || (error instanceof InferenceError ? error.message : 'Report failed; check evidence coverage, sign-in, and provider availability.'));
+        job.error = (controller.signal.aborted || this.now() >= job.deadlineAt) ? 'Report deadline exceeded. Retry explicitly.' : (job.providerError || (error instanceof InferenceError ? error.message : 'Report failed; check evidence coverage, sign-in, and provider availability.'));
       }
     } finally {
       await this.save(job).catch(() => {});
