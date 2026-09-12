@@ -28646,3 +28646,31 @@ body.map-width-resizing {
   align-self: flex-start;
 }
 .pro-preview__reopen:hover, .pro-preview__reopen:focus-visible { opacity: 1; }
+
+/* Personal deployment: explicit AI controls and persistent report jobs. */
+.local-ai-settings { padding: 16px; }
+.local-ai-settings.active { display: grid; gap: 20px; }
+.local-ai-settings section { display: grid; gap: 12px; min-width: 0; }
+.local-ai-settings h3, .local-ai-settings h4, .local-ai-settings p { margin: 0; }
+.local-ai-settings p { line-height: 1.5; }
+.local-ai-settings fieldset { border: 1px solid var(--border); padding: 12px; border-radius: 6px; }
+.local-ai-settings legend { padding: 0 6px; }
+.local-ai-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-bottom: 8px; }
+.local-ai-field { display: grid; gap: 6px; min-width: 0; }
+.local-ai-field[hidden] { display: none; }
+.local-ai-settings input, .local-ai-settings select, .local-ai-settings button {
+  background: var(--bg-secondary); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 4px; padding: 8px; font: inherit; min-width: 0;
+}
+.local-ai-settings button { cursor: pointer; width: fit-content; }
+.local-ai-settings button:disabled { opacity: .55; cursor: not-allowed; }
+.local-ai-settings [role="alert"], #local-ai-model-warning { color: var(--semantic-high, #ffb454); }
+.local-ai-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.local-ai-job { border-top: 1px solid var(--border); padding: 14px 0; display: grid; gap: 8px; }
+.local-ai-job summary { cursor: pointer; }
+.local-ai-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
+.local-ai-settings dl { margin: 8px 0; }
+.local-ai-settings dt { font-weight: 600; margin-top: 10px; text-transform: capitalize; }
+.local-ai-settings dd { margin: 4px 0 4px 12px; }
+.local-ai-settings a { color: var(--accent); overflow-wrap: anywhere; }
+@media (width <= 600px) { .local-ai-fields { grid-template-columns: 1fr; } }

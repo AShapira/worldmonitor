@@ -9,6 +9,7 @@ import { isIP } from 'node:net';
 import { promisify } from 'node:util';
 import { brotliCompress, gzipSync } from 'node:zlib';
 import path from 'node:path';
+import { hasInferenceAuth, proxyLocalAi, runLocalAiReport, buildReportRequest, inferenceRequestTimeout } from './local-ai.mjs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const sharedResourceRoot = process.env.LOCAL_API_RESOURCE_DIR
@@ -284,7 +285,15 @@ globalThis.fetch = async function ipv4Fetch(input, init) {
       // Catches a peer that accepts the connection and then goes silent
       // forever (no error, no close, no data) -- the only stall shape none
       // of the listeners above ever observe.
-      req.setTimeout(_upstreamIdleTimeoutMs, () => {
+      let idleTimeout = _upstreamIdleTimeoutMs;
+      // Only the fixed inference origin may remain silent during reasoning.
+      // All external upstreams keep their normal inactivity protection.
+      try {
+        if (process.env.WM_INFERENCE_URL && url.origin === new URL(process.env.WM_INFERENCE_URL).origin) {
+          idleTimeout = Math.min(310_000, inferenceRequestTimeout(310_000) + 5_000);
+        }
+      } catch { /* invalid configuration stays fail closed */ }
+      req.setTimeout(idleTimeout, () => {
         req.destroy();
         settle(reject, new Error('upstream request idle-timed out'));
       });
@@ -1473,6 +1482,29 @@ async function dispatch(requestUrl, req, routes, context) {
     return new Response(html, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'permissions-policy': 'autoplay=*, encrypted-media=*, storage-access=(self "https://www.youtube.com")', ...makeCorsHeaders(req) } });
   }
 
+  // Broker callbacks have a separate credential. A browser transport token
+  // can never manufacture an explicit inference job or its model profile.
+  if (requestUrl.pathname === '/api/local-ai/run') {
+    if (!hasInferenceAuth(req.headers)) return json({ error: 'Unauthorized' }, 401);
+    if (req.method !== 'POST') return json({ error: 'POST required' }, 405);
+    let body;
+    try {
+      const raw = await readBody(req);
+      if (!raw || raw.length > 64 * 1024) return json({ error: 'Invalid report body' }, 400);
+      body = JSON.parse(raw.toString());
+    } catch { return json({ error: 'Invalid JSON' }, 400); }
+    return runLocalAiReport(body, {
+      resourceRoot: sharedResourceRoot,
+      invoke: async (kind, input) => {
+        const request = buildReportRequest(kind, input, context.port);
+        const modulePath = path.join(sharedResourceRoot, 'local-ai/report-handlers.mjs');
+        if (!existsSync(modulePath)) return json({ error: 'report_handler_missing' }, 503);
+        const handler = await importHandler(modulePath);
+        return handler.runNativeReport(kind, input, request);
+      },
+    });
+  }
+
   // ── Global auth gate ────────────────────────────────────────────────────
   // Every endpoint below requires a valid LOCAL_API_TOKEN.  This prevents
   // other local processes, malicious browser scripts, and rogue extensions
@@ -1499,6 +1531,10 @@ async function dispatch(requestUrl, req, routes, context) {
   if (!hasTransportAuth && !hasLegacyAuth) {
     context.logger.warn(`[local-api] unauthorized request to ${requestUrl.pathname}`);
     return json({ error: 'Unauthorized' }, 401);
+  }
+
+  if (requestUrl.pathname.startsWith('/api/local-ai/')) {
+    return proxyLocalAi(requestUrl, req, { readBody });
   }
 
   if (requestUrl.pathname === '/api/local-status') {
@@ -1954,7 +1990,7 @@ export async function createLocalApiServer(options = {}) {
         // endpoints; OLLAMA_API_URL is the supported desktop runtime setting.
         // Without trusting their exact configured origins, the global SSRF
         // guard blocks every private LLM probe and silently skips the provider.
-        for (const envKey of ['LLM_API_URL', 'OLLAMA_API_URL']) {
+        for (const envKey of ['LLM_API_URL', 'OLLAMA_API_URL', 'WM_INFERENCE_URL']) {
           addConfiguredPrivateOrigin(envKey, 'LLM calls will be SSRF-blocked');
         }
       }

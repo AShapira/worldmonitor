@@ -60,6 +60,17 @@ interface PersistedSnapshot {
   mobility?: PersistedMobility;
   evidence?: PersistedEvidence[];
   narrative?: PersistedNarrative;
+  // Personal managed deployment only. This is persisted JSON metadata, not
+  // a generated/public proto extension; the reader renders provenance in text.
+  narrative_status?: 'retained' | 'unavailable';
+  retained_narrative?: {
+    generated_at: number;
+    snapshot_id: string;
+    provider: string;
+    model: string;
+    narrative: PersistedNarrative;
+    evidence: PersistedEvidence[];
+  };
 }
 
 interface PersistedMeta {
@@ -438,10 +449,36 @@ function adaptNarrative(raw: PersistedNarrative | undefined): RegionalNarrative 
 
 /** Full snake_case -> camelCase adapter for RegionalSnapshot. */
 export function adaptSnapshot(raw: PersistedSnapshot): RegionalSnapshot {
+  let narrative = raw.narrative;
+  let evidence = raw.evidence ?? [];
+  const meta = adaptMeta(raw.meta);
+  const saved = raw.retained_narrative;
+  if (raw.narrative_status === 'retained' && saved && Number.isFinite(saved.generated_at)) {
+    const prefix = `saved:${saved.snapshot_id}:`;
+    const section = (value: PersistedNarrativeSection | undefined): PersistedNarrativeSection => ({
+      text: value?.text ?? '', evidence_ids: (value?.evidence_ids ?? []).map((id) => prefix + id),
+    });
+    narrative = {
+      situation: section(saved.narrative.situation),
+      balance_assessment: section(saved.narrative.balance_assessment),
+      outlook_24h: section(saved.narrative.outlook_24h),
+      outlook_7d: section(saved.narrative.outlook_7d),
+      outlook_30d: section(saved.narrative.outlook_30d),
+      watch_items: (saved.narrative.watch_items ?? []).map(section),
+    };
+    narrative.situation!.text = `AI generation paused or unavailable. Saved report generated ${new Date(saved.generated_at).toISOString()} using ${saved.model}; its outlook periods refer to that date.\n\n${narrative.situation!.text}`;
+    // Saved evidence is separately namespaced so a refreshed observation with
+    // the same logical id cannot replace the older report's actual support.
+    evidence = [...evidence, ...saved.evidence.map((item) => ({ ...item, id: prefix + item.id }))];
+    meta.narrativeProvider = saved.provider;
+    meta.narrativeModel = saved.model;
+  } else if (raw.narrative_status === 'unavailable') {
+    narrative = { situation: { text: 'Automatic AI generation is paused or unavailable. No complete previous report is available.', evidence_ids: [] } };
+  }
   return {
     regionId: raw.region_id ?? '',
     generatedAt: raw.generated_at ?? 0,
-    meta: adaptMeta(raw.meta),
+    meta,
     regime: adaptRegime(raw.regime),
     balance: adaptBalance(raw.balance),
     actors: (raw.actors ?? []).map(adaptActor),
@@ -450,8 +487,8 @@ export function adaptSnapshot(raw: PersistedSnapshot): RegionalSnapshot {
     transmissionPaths: (raw.transmission_paths ?? []).map(adaptTransmissionPath),
     triggers: adaptTriggerLadder(raw.triggers),
     mobility: adaptMobility(raw.mobility),
-    evidence: (raw.evidence ?? []).map(adaptEvidence),
-    narrative: adaptNarrative(raw.narrative),
+    evidence: evidence.map(adaptEvidence),
+    narrative: adaptNarrative(narrative),
   };
 }
 

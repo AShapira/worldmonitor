@@ -187,6 +187,7 @@ export class InsightsPanel extends Panel {
 
     let brief = this.cachedBrief;
     let sources = this.cachedBriefSources;
+    let briefExtras = '';
     if (!brief) {
       let server = getServerInsights();
       if (!server) {
@@ -206,6 +207,7 @@ export class InsightsPanel extends Panel {
       if (server?.worldBrief) {
         brief = server.worldBrief;
         sources = InsightsPanel.serverBriefSources(server);
+        briefExtras = this.renderBriefExtras(server);
       }
     }
     if (!brief) return;
@@ -213,7 +215,7 @@ export class InsightsPanel extends Panel {
 
     this.setDataBadge('cached');
     this.setSafeContent(unsafeRawHtml(
-      this.renderWorldBrief(brief, sources),
+      this.renderWorldBrief(brief, sources, briefExtras),
       'renderWorldBrief formats and links the cached summary (#4890 early brief paint)',
     ));
   }
@@ -398,7 +400,7 @@ export class InsightsPanel extends Panel {
       // resolves inside the debounce window this paint costs nothing.
       if (serverInsights.worldBrief) {
         this.setSafeContent(unsafeRawHtml(
-          this.renderWorldBrief(serverInsights.worldBrief, InsightsPanel.serverBriefSources(serverInsights)),
+          this.renderWorldBrief(serverInsights.worldBrief, InsightsPanel.serverBriefSources(serverInsights), this.renderBriefExtras(serverInsights)),
           'renderWorldBrief formats and links the server summary (#7118 pre-sentiment paint)',
         ));
       }
@@ -410,7 +412,7 @@ export class InsightsPanel extends Panel {
 
       if (this.updateGeneration !== thisGeneration) return;
 
-      this.setDataBadge('live');
+      this.setDataBadge(serverInsights.briefStatus === 'retained' ? 'cached' : serverInsights.briefStatus === 'unavailable' ? 'unavailable' : 'live');
       this.renderServerInsights({ ...serverInsights, topStories: sortedStories }, sentiments);
     } catch (error) {
       console.error('[InsightsPanel] Server path error, falling back:', error);
@@ -627,7 +629,9 @@ export class InsightsPanel extends Panel {
     const worldBriefSources = InsightsPanel.serverBriefSources(insights);
     const briefHtml = insights.worldBrief
       ? this.renderWorldBrief(insights.worldBrief, worldBriefSources, this.renderBriefExtras(insights))
-      : '';
+      : insights.briefStatus === 'unavailable'
+        ? '<div class="insights-brief-freshness">Automatic AI generation is paused or unavailable. No complete previous report is available; headlines continue to update.</div>'
+        : '';
     if (insights.worldBrief) {
       // #4890: keep the persistent brief cache warm from the dominant server
       // path (previously only the client-LLM fallback wrote it, so repeat
@@ -760,7 +764,7 @@ export class InsightsPanel extends Panel {
         </details>`
       : '';
     let footer = '';
-    const generatedMs = new Date(insights.generatedAt).getTime();
+    const generatedMs = new Date(insights.briefGeneratedAt || insights.generatedAt).getTime();
     const newestMs = insights.sourceAgeRange?.newestMs;
     // Pre-rollout payloads lack sourceAgeRange — omit the footer rather
     // than rendering a literal "?h old" (#4928 external review P3).
@@ -772,7 +776,10 @@ export class InsightsPanel extends Panel {
         hours: String(newestAgeH),
       })}</div>`;
     }
-    return linesHtml + footer;
+    const notice = insights.briefStatus === 'retained'
+      ? `<div class="insights-brief-freshness">AI generation paused or unavailable. Saved report from ${escapeHtml(insights.briefGeneratedAt || insights.generatedAt)} using ${escapeHtml(insights.briefModel || insights.briefProvider)}. Headlines below continue to update.</div>`
+      : '';
+    return notice + linesHtml + footer;
   }
 
   private renderWorldBrief(brief: string, sources: BriefSource[] = [], extrasHtml = ''): string {

@@ -25,7 +25,7 @@ import {
   setResponseHeader,
 } from '../../../_shared/response-headers';
 import { stripThinkingTags } from '../../../_shared/llm';
-import { isLocalLlmProfile, localLlmCacheTag } from '../../../../scripts/_local-llm-profile.mjs';
+import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from '../../../../scripts/_local-llm-profile.mjs';
 import { buildLlmCallEvent, deliverUsageEvents } from '../../../_shared/usage';
 
 // Best-effort llm_call telemetry (#4895). This handler bypasses callLlm (the
@@ -160,7 +160,10 @@ export async function summarizeArticle(
     openrouter: 'OPENROUTER_API_KEY not configured',
   };
 
-  const credentials = isLocalLlmProfile() && provider !== 'ollama' ? null : getProviderCredentials(provider);
+  const managedInference = process.env.WM_INFERENCE_ENABLED === '1' || Boolean(process.env.WM_INFERENCE_URL);
+  const credentials = managedInference && provider === 'ollama'
+    ? { apiUrl: process.env.WM_INFERENCE_URL || 'managed-inference-unavailable', model: 'managed', headers: {}, extraBody: {} }
+    : isLocalLlmProfile() && provider !== 'ollama' ? null : getProviderCredentials(provider);
   if (!credentials) {
     return {
       summary: '',
@@ -203,7 +206,7 @@ export async function summarizeArticle(
       cacheKey,
       CACHE_TTL_SECONDS,
       async () => {
-        if (!(await isProviderAvailable(apiUrl))) return null;
+        if (!managedInference && !(await isProviderAvailable(apiUrl))) return null;
         // Full injection sanitization applied at prompt-build time only.
         // Headlines are re-sanitized here (not at cache-key time) so that
         // the cache key stays aligned with the browser while the actual
@@ -279,7 +282,16 @@ export async function summarizeArticle(
 
         const llmStartMs = Date.now();
         const llmPromptChars = effectiveSystemPrompt.length + userPrompt.length;
-        const response = await fetch(apiUrl, {
+        const managedResult = managedInference ? await callLocalLlm({
+          systemPrompt: effectiveSystemPrompt, userPrompt, maxTokens: 100, temperature: 0.3,
+          report: false, background: true,
+        }) : undefined;
+        if (managedInference && !managedResult) return null;
+        const response = managedResult ? new Response(JSON.stringify({
+          model: managedResult.model,
+          choices: [{ message: { content: managedResult.text }, finish_reason: managedResult.finishReason }],
+          usage: { total_tokens: managedResult.tokens },
+        }), { headers: { 'Content-Type': 'application/json' } }) : await fetch(apiUrl, {
           method: 'POST',
           headers: { ...providerHeaders, 'User-Agent': CHROME_UA },
           body: JSON.stringify({
@@ -331,14 +343,14 @@ export async function summarizeArticle(
         }
 
         await emitSummarizeLlmEvent({ provider, model, ok: Boolean(rawContent), durationMs: Date.now() - llmStartMs, promptChars: llmPromptChars, usage, reason: rawContent ? '' : 'empty' });
-        return rawContent ? { summary: rawContent, model, tokens } : null;
+        return rawContent ? { summary: rawContent, model: managedResult?.model || model, tokens } : null;
       },
       undefined,
       {
         // This cache key is intentionally provider-independent so a successful
         // summary can be reused across the client fallback chain. Provider-
         // local failures and in-flight work must not suppress another provider.
-        shouldFetch: () => isModelUsable(apiUrl, model),
+        shouldFetch: () => managedInference || isModelUsable(apiUrl, model),
         cacheFailures: false,
         inflightKey: `${cacheKey}:${provider}:${model}`,
       },

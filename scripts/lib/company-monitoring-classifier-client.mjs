@@ -285,6 +285,12 @@ export async function requestCompanyMonitoringClassification({
   timeoutMs = COMPANY_MONITORING_CLASSIFIER_DEFAULT_TIMEOUT_MS,
   approvedResolvedModels: configuredApprovedResolvedModels = [],
 }) {
+  // This classifier promises an explicitly approved OpenRouter route and
+  // provider attestation. The subscription/local deployment cannot honor that
+  // contract, so suppress it rather than silently bill an external API.
+  if (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) {
+    throw configurationError('Company monitoring classifier is unavailable under managed local inference');
+  }
   const configuredApiKey = requireConfiguredString(apiKey, 'apiKey');
   const configuredModel = requireConfiguredString(model, 'model');
   const configuredProviderRoute = requireConfiguredString(providerRoute, 'providerRoute');

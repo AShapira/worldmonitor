@@ -43,6 +43,10 @@ export interface ServerInsights {
   sourceAgeRange?: { newestMs: number; oldestMs: number } | null;
   worldBriefSources?: ServerBriefSource[];
   briefProvider: string;
+  briefModel?: string;
+  /** Original report clock; generatedAt still tracks the current collected stories. */
+  briefGeneratedAt?: string | null;
+  briefStatus?: 'retained' | 'unavailable';
   status: 'ok' | 'degraded';
   topStories: ServerInsightStory[];
   generatedAt: string;

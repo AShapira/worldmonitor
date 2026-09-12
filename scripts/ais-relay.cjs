@@ -4886,6 +4886,19 @@ function classifyFetchLlmSingle(titles, _apiKey, apiUrl, model, headers, extraBo
 }
 
 async function classifyFetchLlm(titles) {
+  if (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) {
+    // The central policy owns GPU reservation; this background classifier
+    // must never reload Ollama or fall through to a paid provider.
+    try {
+      const { callLocalLlm } = await import('./_local-llm-profile.mjs');
+      const sanitized = titles.map((t) => t.replace(/[\n\r]/g, ' ').replace(/\|/g, '/').slice(0, 200).trim());
+      const result = await callLocalLlm({ systemPrompt: CLASSIFY_SYSTEM_PROMPT,
+        userPrompt: sanitized.map((title, i) => `${i}|${title}`).join('\n'),
+        maxTokens: titles.length * 40, temperature: 0, report: false, background: true });
+      const match = result?.text?.match(/\[[\s\S]*\]/);
+      return match ? JSON.parse(match[0]) : null;
+    } catch { return null; }
+  }
   for (const provider of CLASSIFY_LLM_PROVIDERS) {
     const envVal = process.env[provider.envKey];
     if (!envVal) continue;
@@ -5112,7 +5125,7 @@ async function seedClassify() {
   classifyInFlight = true;
   const t0 = Date.now();
   try {
-    const hasAnyProvider = CLASSIFY_LLM_PROVIDERS.some((p) => !!process.env[p.envKey]);
+    const hasAnyProvider = (process.env.WM_INFERENCE_ENABLED === '1' || Boolean(process.env.WM_INFERENCE_URL)) || CLASSIFY_LLM_PROVIDERS.some((p) => !!process.env[p.envKey]);
     if (!hasAnyProvider) {
       console.log('[Classify] Skipped — no LLM provider keys configured');
       return;
@@ -5169,7 +5182,7 @@ async function startClassifySeedLoop() {
     console.log('[Classify] Disabled (no Upstash Redis)');
     return;
   }
-  const activeProviders = CLASSIFY_LLM_PROVIDERS.filter((p) => !!process.env[p.envKey]).map((p) => p.name);
+  const activeProviders = (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) ? ['managed-local-policy'] : CLASSIFY_LLM_PROVIDERS.filter((p) => !!process.env[p.envKey]).map((p) => p.name);
   console.log(`[Classify] Seed loop starting (interval ${CLASSIFY_SEED_INTERVAL_MS / 1000 / 60}min, providers:${activeProviders.length ? activeProviders.join(',') : 'none'})`);
   startBootSeedLoop('Classify', 'seed-meta:classify', CLASSIFY_SEED_INTERVAL_MS, seedClassify, (e) => console.warn('[Classify] Initial seed error:', e?.message || e), (e) => console.warn('[Classify] Seed error:', e?.message || e));
 }

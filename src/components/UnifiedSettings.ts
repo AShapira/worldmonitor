@@ -1,3 +1,5 @@
+import { LocalAiSettings } from '@/components/LocalAiSettings';
+import { localInferenceEnabled } from '@/services/local-inference';
 import { CANONICAL_FEEDS, INTEL_SOURCES, SOURCE_REGION_MAP } from '@/config/feeds';
 import { WEB_APP_ORIGIN } from '@/config/web-origin';
 import { openExternalUrl } from '@/services/external-navigation';
@@ -136,6 +138,7 @@ export class UnifiedSettings {
   private activePanelCategory = 'all';
   private panelFilter = '';
   private escapeHandler: (e: KeyboardEvent) => void;
+  private localAiSettings: LocalAiSettings | null = null;
   private prefsCleanup: (() => void) | null = null;
   private notifCleanup: (() => void) | null = null;
   private pendingNotifs: NotificationsSettingsResult | null = null;
@@ -701,6 +704,8 @@ export class UnifiedSettings {
     this.historyRegistered = false;
     this.overlay.classList.remove('active');
     this.focusTrap.deactivate();
+    this.localAiSettings?.destroy();
+    this.localAiSettings = null;
     this.prefsCleanup?.();
     this.prefsCleanup = null;
     this.notifCleanup?.();
@@ -763,6 +768,8 @@ export class UnifiedSettings {
     if (this.historyRegistered) overlayHistory.close('settings');
     this.historyRegistered = false;
     if (this.savedTimeout) clearTimeout(this.savedTimeout);
+    this.localAiSettings?.destroy();
+    this.localAiSettings = null;
     this.prefsCleanup?.();
     this.prefsCleanup = null;
     this.notifCleanup?.();
@@ -803,6 +810,8 @@ export class UnifiedSettings {
   }
 
   private render(loadAccountData = true): void {
+    this.localAiSettings?.destroy();
+    this.localAiSettings = null;
     this.prefsCleanup?.();
     this.prefsCleanup = null;
     this.notifCleanup?.();
@@ -829,6 +838,7 @@ export class UnifiedSettings {
     const showEmbedsTab = hasEmbedAccessForAccount(getAuthState().user?.role);
     const availableTabs: TabId[] = [
       'settings',
+      ...(localInferenceEnabled ? ['ai' as const] : []),
       ...(isSignedIn ? ['billing' as const] : []),
       'panels',
       'sources',
@@ -849,6 +859,7 @@ export class UnifiedSettings {
         </div>
         <div class="unified-settings-tabs" role="tablist" aria-label="Settings">
           <button class="${tabClass('settings')}" tabindex="${this.activeTab === 'settings' ? 0 : -1}" data-tab="settings" role="tab" aria-selected="${this.activeTab === 'settings'}" id="us-tab-settings" aria-controls="us-tab-panel-settings">${t('header.tabSettings')}</button>
+          ${localInferenceEnabled ? `<button class="${tabClass('ai')}" tabindex="${this.activeTab === 'ai' ? 0 : -1}" data-tab="ai" role="tab" aria-selected="${this.activeTab === 'ai'}" id="us-tab-ai" aria-controls="us-tab-panel-ai">AI</button>` : ''}
           ${isSignedIn ? `<button class="${tabClass('billing')}" tabindex="${this.activeTab === 'billing' ? 0 : -1}" data-tab="billing" role="tab" aria-selected="${this.activeTab === 'billing'}" id="us-tab-billing" aria-controls="us-tab-panel-billing">Plan &amp; billing</button>` : ''}
           <button class="${tabClass('panels')}" tabindex="${this.activeTab === 'panels' ? 0 : -1}" data-tab="panels" role="tab" aria-selected="${this.activeTab === 'panels'}" id="us-tab-panels" aria-controls="us-tab-panel-panels">${t('header.tabPanels')}</button>
           <button class="${tabClass('sources')}" tabindex="${this.activeTab === 'sources' ? 0 : -1}" data-tab="sources" role="tab" aria-selected="${this.activeTab === 'sources'}" id="us-tab-sources" aria-controls="us-tab-panel-sources">${t('header.tabSources')}</button>
@@ -860,6 +871,7 @@ export class UnifiedSettings {
         <div class="unified-settings-tab-panel${this.activeTab === 'settings' ? ' active' : ''}" data-panel-id="settings" id="us-tab-panel-settings" role="tabpanel" aria-labelledby="us-tab-settings">
           ${prefs.html}
         </div>
+        ${localInferenceEnabled ? `<div class="unified-settings-tab-panel${this.activeTab === 'ai' ? ' active' : ''}" data-panel-id="ai" id="us-tab-panel-ai" role="tabpanel" aria-labelledby="us-tab-ai"></div>` : ''}
         ${isSignedIn ? `
         <div class="unified-settings-tab-panel${this.activeTab === 'billing' ? ' active' : ''}" data-panel-id="billing" id="us-tab-panel-billing" role="tabpanel" aria-labelledby="us-tab-billing">
           <div class="billing-settings-intro">
@@ -937,6 +949,7 @@ export class UnifiedSettings {
     // open even if they never visit this tab.
     this.pendingNotifs = notifs;
     if (this.activeTab === 'notifications') this.attachNotificationsTab();
+    if (this.activeTab === 'ai') this.attachLocalAiTab();
 
     const closeBtn = this.overlay.querySelector<HTMLButtonElement>('.unified-settings-close');
     if (closeBtn) {
@@ -997,6 +1010,8 @@ export class UnifiedSettings {
 
   private switchTab(tab: TabId): void {
     this.activeTab = tab;
+    if (tab === 'ai') this.attachLocalAiTab();
+    else { this.localAiSettings?.destroy(); this.localAiSettings = null; }
 
     updateSettingsTabSelection(
       this.overlay.querySelectorAll<HTMLElement>('.unified-settings-tab'),
@@ -1026,6 +1041,11 @@ export class UnifiedSettings {
     if (tab === 'notifications') {
       this.attachNotificationsTab();
     }
+  }
+
+  private attachLocalAiTab(): void {
+    const panel = this.overlay.querySelector<HTMLElement>('#us-tab-panel-ai');
+    if (localInferenceEnabled && panel && !this.localAiSettings) this.localAiSettings = new LocalAiSettings(panel);
   }
 
   private attachNotificationsTab(): void {

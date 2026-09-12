@@ -96,6 +96,12 @@ const LLM_PROVIDERS = [
  * @returns {Promise<string|null>} Generated text, or null if all providers fail
  */
 async function callLLM(systemPrompt, userPrompt, opts = {}) {
+  if (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) {
+    const { callLocalLlm } = await import('../_local-llm-profile.mjs');
+    const result = await callLocalLlm({ systemPrompt, userPrompt, maxTokens: opts.maxTokens,
+      temperature: opts.temperature, timeoutMs: opts.timeoutMs, report: false, background: true });
+    return result ? stripReasoningPreamble(result.text) : null;
+  }
   const {
     maxTokens = 500,
     temperature = 0.3,

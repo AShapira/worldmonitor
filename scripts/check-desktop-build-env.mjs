@@ -42,6 +42,7 @@ export const REQUIRED_DESKTOP_BUILD_ENV = [
 // SPA-read VITE_ vars that desktop builds deliberately do NOT set.
 // Every entry needs a reason: this map is the decision record.
 export const EXCLUDED_DESKTOP_BUILD_ENV = {
+  VITE_LOCAL_INFERENCE: 'personal Podman inference controls; credentials stay in the local API service',
   VITE_LOCAL_LLM_PROFILE: 'local Podman model profile; desktop uses runtime settings',
   VITE_LOCAL_LLM_MODEL: 'public local Podman model identity for browser caches',
   VITE_LOCAL_OPERATOR_MODE: 'self-hosted Podman web profile only; requires its same-origin operator-key gateway, which desktop builds do not provide',

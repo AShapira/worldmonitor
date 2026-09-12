@@ -1,0 +1,9 @@
+{
+  "name": "worldmonitor-local-inference",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test *.test.mjs", "start": "node server.mjs" },
+  "dependencies": { "@openai/codex": "0.153.4" }
+}

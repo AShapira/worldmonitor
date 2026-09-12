@@ -187,7 +187,7 @@ describe('RHEL rootless Podman deployment', () => {
   it('allows only configured private LLM origins through the Docker sidecar SSRF guard', () => {
     const sidecar = read('src-tauri/sidecar/local-api-server.mjs');
     assert.match(sidecar, /context\.mode === 'docker'/);
-    assert.match(sidecar, /\['LLM_API_URL', 'OLLAMA_API_URL'\]/);
+    assert.match(sidecar, /\['LLM_API_URL', 'OLLAMA_API_URL', 'WM_INFERENCE_URL'\]/);
     assert.match(sidecar, /addConfiguredPrivateOrigin\(envKey, 'LLM calls will be SSRF-blocked'\)/);
   });
 });

@@ -1,3 +1,4 @@
+import { inferenceDeadlineTimeout } from '../../../_shared/inference-context';
 import type {
   ServerContext,
   BriefSource as CountryIntelBriefSource,
@@ -306,7 +307,7 @@ Rules:
         generatedAt: Date.now(),
         sources: entrySources,
       };
-    }, undefined, isLocalLlmProfile() ? { timeoutMs: 100_000 } : undefined);
+    }, undefined, isLocalLlmProfile() ? { timeoutMs: inferenceDeadlineTimeout(100_000) } : undefined);
   } catch {
     return empty;
   }

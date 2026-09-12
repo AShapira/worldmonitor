@@ -19,12 +19,14 @@ ARG VITE_MAP_INTERACTION_MODE=3d
 ARG VITE_PMTILES_URL=
 ARG VITE_LOCAL_OPERATOR_MODE=0
 ARG VITE_LOCAL_LLM_PROFILE=
+ARG VITE_LOCAL_INFERENCE=0
 ARG VITE_LOCAL_LLM_MODEL=
 ENV VITE_VARIANT=${VITE_VARIANT} \
     VITE_MAP_INTERACTION_MODE=${VITE_MAP_INTERACTION_MODE} \
     VITE_PMTILES_URL=${VITE_PMTILES_URL} \
     VITE_LOCAL_OPERATOR_MODE=${VITE_LOCAL_OPERATOR_MODE} \
     VITE_LOCAL_LLM_PROFILE=${VITE_LOCAL_LLM_PROFILE} \
+    VITE_LOCAL_INFERENCE=${VITE_LOCAL_INFERENCE} \
     VITE_LOCAL_LLM_MODEL=${VITE_LOCAL_LLM_MODEL}
 
 # Install root dependencies (layer-cached until package.json changes)
@@ -94,6 +96,8 @@ WORKDIR /app
 
 # API server
 COPY --from=builder /app/src-tauri/sidecar/local-api-server.mjs ./local-api-server.mjs
+COPY --from=builder /app/src-tauri/sidecar/local-ai.mjs ./local-ai.mjs
+COPY --from=builder /app/local-ai ./local-ai
 COPY --from=builder /app/src-tauri/sidecar/package.json ./package.json
 COPY --from=builder /app/shared/llm-health-providers.js ./shared/llm-health-providers.js
 ENV LOCAL_API_RESOURCE_DIR=/app

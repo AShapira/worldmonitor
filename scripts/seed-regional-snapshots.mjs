@@ -44,6 +44,7 @@ import { ALL_INPUT_KEYS, ALL_META_KEYS } from './regional-snapshot/freshness.mjs
 import { generateSnapshotId, unwrapEnvelope } from './regional-snapshot/_helpers.mjs';
 import { hydrateEnergyImportAggregate } from './regional-snapshot/_energy-import-aggregate.mjs';
 import { generateRegionalNarrative, emptyNarrative } from './regional-snapshot/narrative.mjs';
+import { retainNarrative } from './regional-snapshot/retained-narrative.mjs';
 import { emitRegionalAlerts } from './regional-snapshot/alert-emitter.mjs';
 import { buildMobilityState } from './regional-snapshot/mobility.mjs';
 import { recordRegimeTransition } from './regional-snapshot/regime-history.mjs';
@@ -244,13 +245,23 @@ async function computeSnapshot(regionId, sources, metaSources = {}) {
   // never throws. 'global' is skipped inside the generator.
   const region = REGIONS.find((r) => r.id === regionId);
   const narrativeResult = region
-    ? await generateRegionalNarrative(region, snapshotForPrompt, evidence)
+    ? await generateRegionalNarrative(region, snapshotForPrompt, evidence, (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL)
+      // A narrative-cache hit has no original generation timestamp. Let the
+      // central policy decide first; denied calls preserve the complete prior
+      // snapshot report below rather than re-date a cached narrative.
+      ? { cache: { get: async () => null, set: async () => {} } } : {})
     : { narrative: emptyNarrative(), provider: '', model: '' };
 
   // Step 14: tentative snapshot with the real narrative spliced in.
+  const preservePreviousNarrative = (process.env.WM_INFERENCE_ENABLED === '1' || Boolean(process.env.WM_INFERENCE_URL)) && !narrativeResult.model && regionId !== 'global';
+  const retainedNarrative = preservePreviousNarrative ? retainNarrative(previous) : null;
   const tentativeSnapshot = {
     ...snapshotForPrompt,
     narrative: narrativeResult.narrative,
+    ...(preservePreviousNarrative ? {
+      narrative_status: retainedNarrative ? 'retained' : 'unavailable',
+      ...(retainedNarrative ? { retained_narrative: retainedNarrative } : {}),
+    } : {}),
   };
 
   // Step 15: diff against previous for trigger_reason inference
