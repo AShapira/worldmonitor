@@ -159,3 +159,13 @@ test('subscription failures survive native-handler degradation without fallback'
   assert.match((await finished(engine, job.id)).error, /allowance exhausted/);
   assert.equal(calls.length, 0);
 });
+
+test('graceful shutdown preserves interruption instead of mislabeling it as a deadline', async () => {
+  const { engine } = await fixture({ runReport: async (_job, signal) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(new Error('connection closed')), { once: true });
+  }) });
+  const job = await engine.submit(request); await tick(); engine.close();
+  await tick();
+  const interrupted = await engine.getJob(job.id);
+  assert.equal(interrupted.status, 'interrupted'); assert.match(interrupted.error, /Service stopped/);
+});

@@ -139,7 +139,7 @@ export class InferenceEngine {
       if (!job.completionCount) throw new InferenceError('No valid AI report was produced. Required evidence may be unavailable.');
       job.result = result; job.status = 'completed'; job.completedAt = this.now();
     } catch (error) {
-      if (job.status !== 'cancelled') {
+      if (!['cancelled', 'interrupted'].includes(job.status)) {
         job.status = 'failed';
         job.error = (controller.signal.aborted || this.now() >= job.deadlineAt) ? 'Report deadline exceeded. Retry explicitly.' : (job.providerError || (error instanceof InferenceError ? error.message : 'Report failed; check evidence coverage, sign-in, and provider availability.'));
       }
@@ -205,5 +205,13 @@ export class InferenceEngine {
       previous.finally(release); this.localRequests.delete(controller);
     }
   }
-  close() { for (const entry of this.active.values()) { clearTimeout(entry.timer); entry.controller.abort(); } for (const c of this.localRequests) c.abort(); this.codex.close(); }
+  close() {
+    for (const entry of this.active.values()) {
+      clearTimeout(entry.timer);
+      if (!TERMINAL.has(entry.job.status)) { entry.job.status = 'interrupted'; entry.job.error = 'Service stopped. Retry explicitly.'; }
+      entry.controller.abort();
+    }
+    for (const controller of this.localRequests) controller.abort();
+    this.codex.close();
+  }
 }
