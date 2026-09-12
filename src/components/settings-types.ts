@@ -6,6 +6,7 @@
  */
 export type UnifiedSettingsTabId =
   | 'settings'
+  | 'ai'
   | 'billing'
   | 'panels'
   | 'sources'

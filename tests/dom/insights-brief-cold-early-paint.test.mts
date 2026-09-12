@@ -551,3 +551,21 @@ describe('client render does not hold the brief behind parallel analysis (#7464)
     panel.destroy();
   });
 });
+
+describe('managed daily report provenance', () => {
+  it('shows the retained report date and model during bootstrap paint despite fresh collected headlines', async () => {
+    mockGetPersistentCache.mockResolvedValue(null);
+    mockGetServerInsights.mockReturnValue(serverInsights({
+      generatedAt: new Date().toISOString(), briefGeneratedAt: '2026-09-10T10:00:00Z',
+      briefStatus: 'retained', briefModel: 'qwen3.5:9b',
+      sourceAgeRange: { oldestMs: 1, newestMs: 1 },
+    }));
+    const panel = new InsightsPanel();
+    await flushEarlyPaint();
+    expect(contentOf(panel).textContent).toContain('Saved report from 2026-09-10T10:00:00Z');
+    expect(contentOf(panel).textContent).toContain('qwen3.5:9b');
+    expect(contentOf(panel).textContent).toContain('Headlines below continue to update');
+    expect(contentOf(panel).querySelector('.insights-brief-text')?.textContent).toContain('Russian strikes on Kyiv');
+    panel.destroy();
+  });
+});

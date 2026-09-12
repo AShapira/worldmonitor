@@ -1,0 +1,52 @@
+# Opt-in personal deployment: scripts/podman-local.sh inference-init.
+# The private broker uses ChatGPT sign-in and has no GPU or host filesystem access.
+services:
+  worldmonitor:
+    build:
+      args:
+        VITE_LOCAL_INFERENCE: "1"
+    environment:
+      WM_INFERENCE_ENABLED: "1"
+      WM_INFERENCE_URL: "http://inference:8080"
+      WM_INFERENCE_TOKEN: "${WM_INFERENCE_TOKEN:?Run scripts/podman-local.sh inference-init}"
+    depends_on:
+      inference:
+        condition: service_started
+  ais-relay:
+    environment:
+      WM_INFERENCE_ENABLED: "1"
+      WM_INFERENCE_URL: "http://inference:8080"
+      WM_INFERENCE_TOKEN: "${WM_INFERENCE_TOKEN:?Run scripts/podman-local.sh inference-init}"
+  inference:
+    image: "${WM_INFERENCE_IMAGE:-localhost/worldmonitor-inference:0.153.4}"
+    build:
+      context: docker/inference
+      dockerfile: Dockerfile
+    container_name: worldmonitor-inference
+    ports:
+      - "127.0.0.1:${WM_INFERENCE_PORT:-46124}:8080"
+    environment:
+      WM_INFERENCE_TOKEN: "${WM_INFERENCE_TOKEN:?Run scripts/podman-local.sh inference-init}"
+      UPSTASH_REDIS_REST_URL: "http://redis-rest:80"
+      UPSTASH_REDIS_REST_TOKEN: "${REDIS_TOKEN:?REDIS_TOKEN required}"
+      WM_INFERENCE_OLLAMA_URL: "http://ollama:11434"
+      WM_INFERENCE_RUN_URL: "http://worldmonitor:8080/api/local-ai/run"
+    volumes:
+      - inference-auth:/state
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    pids_limit: 128
+    depends_on:
+      redis-rest:
+        condition: service_started
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+volumes:
+  inference-auth:

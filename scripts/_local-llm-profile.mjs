@@ -1,10 +1,13 @@
+import { isManagedInference, inferenceTimeout, inferenceCacheTag, callManagedInference } from './_inference-client.mjs';
 // Shared, opt-in policy for the local Podman deployment and host seeders.
 // No credential loading here: callers retain their existing loadEnvFile path.
 export const LOCAL_REPORT_TIMEOUT_MS = 90_000;
 export const LOCAL_REPORT_MAX_TOKENS = 6144;
 const runtimeEnv = () => typeof process === 'undefined' ? {} : process.env;
-export const isLocalLlmProfile = (env = runtimeEnv()) => env.WM_LOCAL_LLM_PROFILE === 'balanced';
+export const isLocalLlmProfile = (env = runtimeEnv()) => env.WM_LOCAL_LLM_PROFILE === 'balanced' || isManagedInference(env);
 export function localLlmCacheTag(env = runtimeEnv()) {
+  const managedTag = inferenceCacheTag(env);
+  if (managedTag) return managedTag;
   if (!isLocalLlmProfile(env)) return '';
   const identity = [env.OLLAMA_MODEL, env.LLM_MODEL, env.WM_LOCAL_LLM_MODEL_DIGEST, env.OLLAMA_CONTEXT_LENGTH || '16384'].join('|');
   let hash = 2166136261;
@@ -13,7 +16,7 @@ export function localLlmCacheTag(env = runtimeEnv()) {
 }
 export function localLlmOptions(report, env = runtimeEnv()) {
   return isLocalLlmProfile(env) ? {
-    timeoutMs: report ? LOCAL_REPORT_TIMEOUT_MS : 25_000,
+    timeoutMs: inferenceTimeout(report ? LOCAL_REPORT_TIMEOUT_MS : 25_000),
     ...(report ? { maxTokens: LOCAL_REPORT_MAX_TOKENS } : {}),
     providerOrder: ['ollama'], enableReasoning: Boolean(report), retryOnLengthLimit: true,
   } : {};
@@ -51,6 +54,7 @@ let backgroundTail = Promise.resolve();
  */
 export async function callLocalLlm(opts) {
   const env = opts.env || runtimeEnv();
+  if (isManagedInference(env)) return callManagedInference(opts);
   if (!isLocalLlmProfile(env)) return null;
   const apiUrl = localEndpoint(env);
   if (!apiUrl || opts.signal?.aborted) return null;

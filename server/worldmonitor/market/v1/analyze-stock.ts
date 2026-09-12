@@ -1,3 +1,4 @@
+import { inferenceDeadlineTimeout } from '../../../_shared/inference-context';
 import type {
   AnalyzeStockRequest,
   AnalyzeStockResponse,
@@ -2071,7 +2072,7 @@ export async function analyzeStock(
         // overhead. 60s safely sits above this so the cache safety net (#3539)
         // doesn't pre-empt the caller's own per-stage timeouts. The local
         // profile permits a 90s overlay, so its enclosing budget is 120s.
-        timeoutMs: isLocalLlmProfile() ? 120_000 : 60_000,
+        timeoutMs: inferenceDeadlineTimeout(isLocalLlmProfile() ? 120_000 : 60_000),
       });
 
   if (cached) return cached;

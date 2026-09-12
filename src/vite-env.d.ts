@@ -15,6 +15,7 @@ declare const __BUILD_HASH__: string;
 declare const __CLERK_JS_VERSION__: string;
 
 interface ImportMetaEnv {
+  readonly VITE_LOCAL_INFERENCE?: string;
   readonly VITE_LOCAL_LLM_PROFILE?: string;
   readonly VITE_LOCAL_LLM_MODEL?: string;
   readonly VITE_SENTRY_DSN?: string;

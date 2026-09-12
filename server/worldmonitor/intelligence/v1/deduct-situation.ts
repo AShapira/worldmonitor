@@ -1,3 +1,4 @@
+import { inferenceDeadlineTimeout } from '../../../_shared/inference-context';
 import type {
     ServerContext,
     DeductSituationRequest,
@@ -157,7 +158,7 @@ export async function deductSituation(
         // Cache safety net must sit above the LLM's own timeout so the
         // caller's bound wins; otherwise the inflight wrapper rejects at
         // the 30s default before callLlmReasoning can complete (#3539).
-        isLocalLlmProfile() ? { timeoutMs: 95_000 } : { timeoutMs: DEDUCT_TIMEOUT_MS + 5_000 },
+        isLocalLlmProfile() ? { timeoutMs: inferenceDeadlineTimeout(95_000) } : { timeoutMs: DEDUCT_TIMEOUT_MS + 5_000 },
     );
 
     if (!cached?.analysis) {

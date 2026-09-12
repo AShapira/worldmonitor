@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { isLocalLlmProfile, localLlmCacheTag, callLocalLlm } from './_local-llm-profile.mjs';
+import { retainInsightsBrief } from './_retained-insights-brief.mjs';
 import {
   loadEnvFile,
   CHROME_UA,
@@ -900,7 +901,7 @@ export function createSynthesisAcceptor(topStories, composerOptions) {
   };
 }
 
-async function fetchInsights() {
+export async function fetchInsights() {
   const digest = await readOrWarmDigest('en');
   if (!digest) {
     // LKG fallback: reuse existing insights if digest is unavailable
@@ -1100,6 +1101,10 @@ async function fetchInsights() {
       console.log(`  [brief_attribution] ${composed.sourceAttributions} lead sentence(s) named their source outlet`);
     }
     console.log(`  Brief synthesized (top-${topStories.length}) via ${briefProvider} (${briefModel})`);
+  } else if (process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) {
+    // Managed denial or invalid output must not replace a previously validated
+    // report with an L2 downgrade. Fresh collection is still published below.
+    status = 'degraded';
   } else {
     console.warn(
       `  [brief_synthesis] rejected (${synthesisFailureCode || INSIGHTS_SYNTHESIS_FAILURE_CODES.PROVIDER})`
@@ -1216,6 +1221,17 @@ async function fetchInsights() {
     chinaNewsCoverage,
   };
 
+  if ((process.env.WM_INFERENCE_ENABLED === '1' || process.env.WM_INFERENCE_URL) && !composed) {
+    const existing = await readExistingInsights();
+    return decorateInsightsRun(retainInsightsBrief(payload, existing), {
+      outcome: INSIGHTS_RUN_OUTCOMES.DEGRADED,
+      failureCode: synthesisFailureCode || INSIGHTS_SYNTHESIS_FAILURE_CODES.PROVIDER,
+      failureDetail: breakerCarriedDetail ?? failureDetail,
+      storiesSignature,
+      briefEligibleClusters,
+    });
+  }
+
   // LKG preservation: don't overwrite "ok" with "degraded"
   if (status === 'degraded') {
     const existing = await readExistingInsights();
@@ -1272,7 +1288,7 @@ export function insightsFreshnessPatchArgs(data, outcome, previousMeta, nowMs = 
     failureDetail: runMeta?.failureDetail ?? null,
     storiesSignature: runMeta?.storiesSignature ?? null,
     nowMs,
-    servedGeneratedAt: data?.generatedAt,
+    servedGeneratedAt: data?.briefGeneratedAt ?? data?.generatedAt,
     briefEligibleClusters: runMeta?.briefEligibleClusters ?? null,
   };
 }

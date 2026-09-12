@@ -105,3 +105,15 @@ const jsFailed = await compileHandlers(jsHandlers, 'build-handlers [JS]');
 const totalFailed = tsFailed + jsFailed;
 console.log(`\nbuild-handlers: complete (${totalFailed} failures)`);
 if (totalFailed > 0) process.exit(1);
+
+
+// These private entry points deliberately live outside api/: the route table
+// must never expose native report functions without the local broker gate.
+for (const [entry, output] of [
+  ['server/_shared/local-ai-handlers.ts', 'report-handlers.mjs'],
+  ['scripts/_local-ai-reports.mjs', 'worker-reports.mjs'],
+]) {
+  await build({ entryPoints: [path.join(projectRoot, entry)],
+    outfile: path.join(projectRoot, 'local-ai', output), bundle: true,
+    format: 'esm', platform: 'node', target: 'node24', treeShaking: true });
+}

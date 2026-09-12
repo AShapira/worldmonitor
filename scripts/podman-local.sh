@@ -26,6 +26,10 @@ find_podman_compose() {
 compose() {
   local podman_compose
   local -a podman_args=()
+  local -a inference_args=()
+  if [[ "$(env_value WM_INFERENCE_ENABLED)" == "1" ]]; then
+    inference_args=(-f "${PROJECT_DIR}/compose.inference.yml")
+  fi
   if [[ -n "${WM_CDI_SPEC_DIR:-}" ]]; then
     podman_args+=("--podman-args=--cdi-spec-dir=${WM_CDI_SPEC_DIR}")
   fi
@@ -36,6 +40,7 @@ compose() {
     "${podman_args[@]}" \
     -f "${BASE_COMPOSE}" \
     -f "${OLLAMA_COMPOSE}" \
+    "${inference_args[@]}" \
     "$@"
 }
 
@@ -207,6 +212,10 @@ pull_model() {
 }
 
 preload_model() {
+  if [[ "$(env_value WM_INFERENCE_ENABLED)" == "1" ]]; then
+    printf "Managed inference: select Local in WorldMonitor AI settings before using the GPU.\n" >&2
+    return 1
+  fi
   local model
   model="$(model_name)"
   curl -fsS --max-time 120 \
@@ -217,6 +226,12 @@ preload_model() {
 }
 
 verify_stack() {
+  if [[ "$(env_value WM_INFERENCE_ENABLED)" == "1" ]]; then
+    wait_for_url http://127.0.0.1:3000/api/sidecar-health 60
+    wait_for_url http://127.0.0.1:46124/health 30
+    printf "Managed services reachable. Check GPU state in AI settings; no inference probe was run.\n"
+    return
+  fi
   local model
   local api_key
   model="$(model_name)"
@@ -281,6 +296,7 @@ usage() {
 Usage: scripts/podman-local.sh COMMAND
 
 Commands:
+  inference-init   Enable managed inference in .env (does not start or deploy)
   init             Generate missing ignored .env settings and secrets
   migrate-model    Back up .env and select Qwen3.5 9B balanced local inference
   config           Validate the merged Compose configuration
@@ -306,6 +322,17 @@ case "${command_name}" in
   init)
     init_env
     ;;
+  inference-init)
+    init_env
+    if has_env_key WM_INFERENCE_ENABLED; then
+      sed -i 's/^WM_INFERENCE_ENABLED=.*/WM_INFERENCE_ENABLED=1/' "${ENV_FILE}"
+    else
+      append_env WM_INFERENCE_ENABLED 1
+    fi
+    append_env WM_INFERENCE_TOKEN "$(openssl rand -hex 32)"
+    append_env WM_INFERENCE_URL "http://127.0.0.1:46124"
+    printf "Managed inference configured. Build/start after reviewing the configuration; sign in from AI settings.\n"
+    ;;
   migrate-model)
     migrate_model_env
     ;;
@@ -327,9 +354,13 @@ case "${command_name}" in
     compose config >/dev/null
     compose build
     compose_up
-    pull_model
-    preload_model
-    verify_stack
+    if [[ "$(env_value WM_INFERENCE_ENABLED)" != "1" ]]; then
+      pull_model
+      preload_model
+      verify_stack
+    else
+      printf "Managed inference started; use AI settings to inspect GPU reservation and sign in.\n"
+    fi
     ;;
   down)
     compose down
