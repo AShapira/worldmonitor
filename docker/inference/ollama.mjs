@@ -35,7 +35,9 @@ export class OllamaClient {
         }, AbortSignal.any([signal, AbortSignal.timeout(Math.max(1, Math.min(remaining, thinking ? 60000 : 25000)))]));
         const choice = data.choices?.[0];
         if (choice?.finish_reason !== 'stop' || choice?.message?.refusal || choice?.message?.tool_calls?.length) continue;
-        const text = choice?.message?.content?.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+        const text = choice?.message?.content?.replace(/<(think|reasoning|reflection)>[\s\S]*?<\/\1>/gi, '')
+          .replace(/<(?:think|reasoning|reflection)>[\s\S]*$/gi, '')
+          .replace(/^```(?:\w+)?\s*/, '').replace(/\s*```$/, '').trim();
         if (text) return { text, model: data.model || profile.model, provider: 'ollama', effort: thinking ? 'on' : 'off', tokens: data.usage?.total_tokens || 0, finishReason: 'stop' };
       } catch { if (signal.aborted) return null; }
     }

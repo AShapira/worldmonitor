@@ -3,6 +3,7 @@
 import { getCountryIntelBrief } from '../worldmonitor/intelligence/v1/get-country-intel-brief';
 import { deductSituation } from '../worldmonitor/intelligence/v1/deduct-situation';
 import { analyzeStock } from '../worldmonitor/market/v1/analyze-stock';
+import { fetchSituationEvidence, hasSupportedSituationCitations } from './local-ai-situation-evidence';
 
 export async function runNativeReport(kind: string, input: Record<string, unknown>, request: Request): Promise<Response> {
   const ctx = { request, pathParams: {}, headers: Object.fromEntries(request.headers.entries()) };
@@ -10,7 +11,16 @@ export async function runNativeReport(kind: string, input: Record<string, unknow
   if (kind === 'country') {
     result = await getCountryIntelBrief(ctx, { countryCode: String(input.countryCode), framework: '' });
   } else if (kind === 'situation') {
-    result = await deductSituation(ctx, { query: String(input.query), geoContext: String(input.geoContext || ''), framework: '' });
+    const evidence = await fetchSituationEvidence(String(input.query));
+    if (!evidence.sources.length) return Response.json({ error: 'source_evidence_unavailable' }, { status: 422 });
+    const deduction = await deductSituation(ctx, { query: String(input.query), geoContext: evidence.context, framework: '' }, {
+      citationCount: evidence.sources.length,
+      validate: (text) => hasSupportedSituationCitations(text, evidence.sources.length),
+    });
+    if (!hasSupportedSituationCitations(deduction.analysis, evidence.sources.length)) {
+      return Response.json({ error: 'invalid_report_output' }, { status: 502 });
+    }
+    result = { ...deduction, sources: evidence.sources, generatedAt: new Date().toISOString() };
   } else if (kind === 'stock') {
     result = await analyzeStock(ctx, { symbol: String(input.symbol), name: String(input.name || ''), includeNews: input.includeNews !== false });
   } else {

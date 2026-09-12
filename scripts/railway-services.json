@@ -99,7 +99,9 @@
       "shared/x-account-source-tiers.json",
       "shared/stablecoin-classifier.cjs",
       "shared/stablecoins.json",
-      "shared/stocks.json"
+      "shared/stocks.json",
+      "scripts/_inference-client.mjs",
+      "scripts/_local-llm-profile.mjs"
     ],
     "documentedAt": "Dockerfile.relay"
   },
@@ -176,7 +178,8 @@
       "scripts/package-lock.json",
       "scripts/package.json",
       "scripts/process-deep-forecast-tasks.mjs",
-      "scripts/seed-forecasts.mjs"
+      "scripts/seed-forecasts.mjs",
+      "scripts/_inference-client.mjs"
     ],
     "documentedAt": "tests/scripts-railway-nixpacks-no-escape-import.test.mts (pre-registry ENTRY_POINTS)"
   },
@@ -258,7 +261,8 @@
       "shared/story-phase.js",
       "shared/ticker-extract.d.ts",
       "shared/ticker-extract.js",
-      "shared/url-classifier.js"
+      "shared/url-classifier.js",
+      "scripts/_inference-client.mjs"
     ],
     "documentedAt": "Dockerfile.digest-notifications"
   },
@@ -551,7 +555,9 @@
       "scripts/shared/physical-divergence-contract.js",
       "scripts/shared/physical-divergence-staleness.js",
       "shared/country-names.json",
-      "shared/iso3-to-iso2.json"
+      "shared/iso3-to-iso2.json",
+      "scripts/_inference-client.mjs",
+      "scripts/regional-snapshot/retained-narrative.mjs"
     ],
     "cronSchedule": "*/5 * * * *",
     "documentedAt": "docs/railway-seed-consolidation-runbook.md#bundle-5-seed-bundle-derived-signals"
@@ -885,7 +891,9 @@
       "scripts/shared/geography.js",
       "scripts/shared/iso2-to-region.json",
       "scripts/shared/iso3-to-iso2.json",
-      "scripts/shared/notification-dedup.cjs"
+      "scripts/shared/notification-dedup.cjs",
+      "scripts/_inference-client.mjs",
+      "scripts/regional-snapshot/retained-narrative.mjs"
     ],
     "documentedAt": "scripts/seed-bundle-regional.mjs (header docblock declares rootDirectory: scripts)"
   },
@@ -1344,7 +1352,8 @@
       "scripts/seed-forecast-resolutions.mjs",
       "scripts/seed-forecasts.mjs",
       "scripts/shared/country-names.json",
-      "shared/country-names.json"
+      "shared/country-names.json",
+      "scripts/_inference-client.mjs"
     ],
     "documentedAt": "scripts/seed-forecast-resolutions.mjs (header docblock declares daily cron)"
   },
@@ -1381,7 +1390,8 @@
       "scripts/nixpacks.toml",
       "scripts/package-lock.json",
       "scripts/package.json",
-      "scripts/seed-forecasts.mjs"
+      "scripts/seed-forecasts.mjs",
+      "scripts/_inference-client.mjs"
     ],
     "documentedAt": "tests/scripts-railway-nixpacks-no-escape-import.test.mts (pre-registry ENTRY_POINTS)"
   },
@@ -1486,7 +1496,9 @@
       "scripts/shared/geo-extract.mjs",
       "scripts/shared/publisher-families.js",
       "scripts/shared/source-tiers.json",
-      "scripts/shared/story-identity.js"
+      "scripts/shared/story-identity.js",
+      "scripts/_inference-client.mjs",
+      "scripts/_retained-insights-brief.mjs"
     ],
     "documentedAt": "tests/scripts-railway-nixpacks-no-escape-import.test.mts (added PR #3836)"
   },
@@ -1686,7 +1698,8 @@
       "scripts/package-lock.json",
       "scripts/package.json",
       "scripts/process-simulation-tasks.mjs",
-      "scripts/seed-forecasts.mjs"
+      "scripts/seed-forecasts.mjs",
+      "scripts/_inference-client.mjs"
     ],
     "documentedAt": "tests/scripts-railway-nixpacks-no-escape-import.test.mts (pre-registry ENTRY_POINTS)"
   },

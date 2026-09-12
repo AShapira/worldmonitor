@@ -105,6 +105,7 @@ const DEDUCT_CACHE_TTL = 3600;
 export async function deductSituation(
     ctx: ServerContext,
     req: DeductSituationRequest,
+    privateEvidence?: { citationCount: number; validate: (text: string) => boolean },
 ): Promise<DeductSituationResponse> {
     const MAX_QUERY_LEN = 500;
     const MAX_GEO_LEN = 2000;
@@ -129,7 +130,7 @@ export async function deductSituation(
         : '';
 
     const predictionHash = predictionContext ? (await sha256Hex(predictionContext)).slice(0, 8) : '';
-    const cacheKey = `deduct:situation:v2:${queryHash.slice(0, 16)}${frameworkHash ? ':fw' + frameworkHash : ''}${predictionHash ? ':pm' + predictionHash : ''}${localLlmCacheTag()}`;
+    const cacheKey = `deduct:situation:v2:${queryHash.slice(0, 16)}${frameworkHash ? ':fw' + frameworkHash : ''}${predictionHash ? ':pm' + predictionHash : ''}${privateEvidence ? ':cited-v1' : ''}${localLlmCacheTag()}`;
 
     const { mode, systemPrompt, userPrompt } = buildDeductionPrompt({ query, geoContext, predictionContext });
 
@@ -139,7 +140,8 @@ export async function deductSituation(
         async () => {
             const result = await callLlmReasoning({
                 messages: [
-                    { role: 'system', content: systemPrompt },
+                    { role: 'system', content: systemPrompt + (privateEvidence
+                        ? `\nCITATIONS: Ground every current factual claim in the numbered WorldMonitor sources using [1] through [${privateEvidence.citationCount}]. Use individual numeric citations, never ranges. Include citations supporting forecast assumptions. Do not invent sources or URLs. State missing evidence and coverage gaps explicitly. Source publication times describe observations, not proof that they remain current.` : '') },
                     { role: 'user', content: userPrompt },
                 ],
                 temperature: 0.3,
@@ -148,6 +150,7 @@ export async function deductSituation(
                 stage: 'deduct-situation',
                 systemAppend: framework || undefined,
                 ...localLlmOptions(true),
+                validate: privateEvidence?.validate,
             });
 
             if (!result) return null;

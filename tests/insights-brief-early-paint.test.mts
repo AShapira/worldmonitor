@@ -48,7 +48,7 @@ describe('InsightsPanel early cached-brief paint (#4890)', () => {
     );
     assert.match(
       method,
-      /this\.renderWorldBrief\(brief, sources\)/,
+      /this\.renderWorldBrief\(brief, sources, briefExtras\)/,
       'the early paint must reuse renderWorldBrief (it formats and links the cached summary)',
     );
   });
