@@ -1934,7 +1934,10 @@ export async function createLocalApiServer(options = {}) {
           const rawUrl = process.env[envKey];
           if (!rawUrl) return;
           try {
-            extraAllowedPrivateOrigins.push(new URL(rawUrl).origin);
+            const fetchUrl = envKey === 'WS_RELAY_URL'
+              ? rawUrl.replace(/^ws(s?):\/\//, 'http$1://')
+              : rawUrl;
+            extraAllowedPrivateOrigins.push(new URL(fetchUrl).origin);
           } catch (err) {
             context.logger.warn(
               `[local-api] ${envKey} is not a valid URL; not added to the private-fetch allowlist (${blockedService}): ${err.message}`,
@@ -1949,6 +1952,10 @@ export async function createLocalApiServer(options = {}) {
         // UPSTASH_REDIS_REST_URL is a public Upstash https origin that already
         // passes the SSRF check, so this path is docker-only.
         addConfiguredPrivateOrigin('UPSTASH_REDIS_REST_URL', 'Redis calls will be SSRF-blocked');
+
+        // The configured AIS relay is another internal Compose service.
+        // Trust only its exact origin, as with Redis and local inference.
+        addConfiguredPrivateOrigin('WS_RELAY_URL', 'AIS relay calls will be SSRF-blocked');
 
         // SELF_HOSTING.md documents LLM_API_URL for compose-network or LAN
         // endpoints; OLLAMA_API_URL is the supported desktop runtime setting.

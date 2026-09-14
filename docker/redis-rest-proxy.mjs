@@ -533,7 +533,13 @@ const CABLE_HEALTH_REPAIR_SCRIPT = [
   'end',
   'return 1',
 ].join('\n');
+// Exact owner-checked release used by scripts/_seed-utils.mjs. Without it,
+// completed local seeders retain their lock until its timeout expires.
+const SEED_LOCK_RELEASE_SCRIPT = [
+  'if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0 end',
+].join('\n');
 const ALLOWED_EVAL_SCRIPTS = new Set([
+  SEED_LOCK_RELEASE_SCRIPT,
   CABLE_HEALTH_REPAIR_SCRIPT,
   SOURCE_RETRY_CLAIM_SCRIPT,
   DIGEST_LASTGOOD_PUBLISH_SCRIPT,

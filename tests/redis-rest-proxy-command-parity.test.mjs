@@ -36,6 +36,7 @@ import {
 } from '../scripts/lib/x-post-budget.cjs';
 import { SOURCE_RETRY_CLAIM_SCRIPT } from '../scripts/_bundle-runner.mjs';
 import { CABLE_HEALTH_REPAIR_SCRIPT } from '../shared/cable-health-repair-script.mjs';
+import { releaseLock } from '../scripts/_seed-utils.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '..');
@@ -198,6 +199,34 @@ describe('redis-rest-proxy command gate', () => {
     assert.equal(accepts(gate, ['EVAL', "redis.call('FLUSHALL')", '0']), false,
       'an unpinned script must be rejected');
     assert.equal(accepts(gate, ['EVAL']), false, 'EVAL with no script must be rejected');
+  });
+
+  it('admits the actual owner-checked seeder lock release, but rejects script variants', async () => {
+    const gate = buildGate();
+    const originalFetch = globalThis.fetch;
+    const oldUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const oldToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+    let emitted;
+    process.env.UPSTASH_REDIS_REST_URL = 'http://localhost:8079';
+    process.env.UPSTASH_REDIS_REST_TOKEN = 'test-only';
+    globalThis.fetch = async (_url, init) => {
+      emitted = JSON.parse(init.body);
+      gate.assertCommandAllowed(emitted);
+      return new Response(JSON.stringify({ result: 1 }));
+    };
+    try {
+      await releaseLock('wildfire:fires', 'test-owner');
+      assert.ok(emitted, 'releaseLock must issue a Redis command');
+      assert.equal(accepts(gate, emitted), true);
+      assert.deepEqual(emitted.slice(2), [1, 'seed-lock:wildfire:fires', 'test-owner']);
+      assert.equal(accepts(gate, ['EVAL', emitted[1] + ' ', ...emitted.slice(2)]), false);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (oldUrl === undefined) delete process.env.UPSTASH_REDIS_REST_URL;
+      else process.env.UPSTASH_REDIS_REST_URL = oldUrl;
+      if (oldToken === undefined) delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      else process.env.UPSTASH_REDIS_REST_TOKEN = oldToken;
+    }
   });
 
   it('pins the physical-premium history append by exact bytes', () => {
