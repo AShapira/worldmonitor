@@ -1057,10 +1057,11 @@ test('allows only Docker mode to fetch configured private Redis REST origin', as
   }
 });
 
-test('allows only Docker mode to fetch configured private LLM origins', async () => {
+test('allows only Docker mode to fetch configured private LLM and AIS relay origins', async () => {
   const envSnapshot = {
     LLM_API_URL: process.env.LLM_API_URL,
     OLLAMA_API_URL: process.env.OLLAMA_API_URL,
+    WS_RELAY_URL: process.env.WS_RELAY_URL,
     UNCONFIGURED_PRIVATE_URL: process.env.UNCONFIGURED_PRIVATE_URL,
   };
   let handlerHits = 0;
@@ -1078,7 +1079,8 @@ test('allows only Docker mode to fetch configured private LLM origins', async ()
     return `http://127.0.0.1:${port}/v1/chat/completions`;
   }
 
-  const [privateLlmUrl, privateOllamaUrl, unconfiguredPrivateUrl] = await Promise.all([
+  const [privateLlmUrl, privateOllamaUrl, privateRelayUrl, unconfiguredPrivateUrl] = await Promise.all([
+    createProbeOrigin(),
     createProbeOrigin(),
     createProbeOrigin(),
     createProbeOrigin(),
@@ -1088,7 +1090,10 @@ test('allows only Docker mode to fetch configured private LLM origins', async ()
     'llm-probe.js': `
       export default async function handler(request) {
         const envKey = new URL(request.url).searchParams.get('envKey');
-        const upstream = await fetch(process.env[envKey], {
+        const url = envKey === 'WS_RELAY_URL'
+          ? process.env[envKey].replace(/^ws(s?):\\/\\//, 'http$1://')
+          : process.env[envKey];
+        const upstream = await fetch(url, {
           headers: { 'x-sidecar-test-probe': '1' },
         });
         const payload = await upstream.text();
@@ -1122,12 +1127,13 @@ test('allows only Docker mode to fetch configured private LLM origins', async ()
   try {
     process.env.LLM_API_URL = privateLlmUrl;
     process.env.OLLAMA_API_URL = privateOllamaUrl;
+    process.env.WS_RELAY_URL = privateRelayUrl;
     process.env.UNCONFIGURED_PRIVATE_URL = unconfiguredPrivateUrl;
-    const envKeys = ['LLM_API_URL', 'OLLAMA_API_URL', 'UNCONFIGURED_PRIVATE_URL'];
+    const envKeys = ['LLM_API_URL', 'OLLAMA_API_URL', 'WS_RELAY_URL', 'UNCONFIGURED_PRIVATE_URL'];
     const dockerResponses = await runProbes('docker', envKeys);
     for (const [index, envKey] of envKeys.entries()) {
       const dockerResponse = dockerResponses[index];
-      if (index < 2) {
+      if (index < 3) {
         assert.equal(dockerResponse.status, 200, envKey);
         assert.deepEqual(await dockerResponse.json(), { ok: true });
       } else {
@@ -1146,12 +1152,19 @@ test('allows only Docker mode to fetch configured private LLM origins', async ()
       assert.equal(desktopBody.error, 'Local handler error');
       assert.match(desktopBody.reason, /SSRF blocked/);
     }
-    assert.equal(handlerHits, 2, 'only Docker handler probes should reach the upstream');
+    assert.equal(handlerHits, 3, 'only Docker handler probes should reach the upstream');
+
+    process.env.WS_RELAY_URL = privateRelayUrl.replace(/^http:/, 'ws:');
+    const [webSocketRelayResponse] = await runProbes('docker', ['WS_RELAY_URL']);
+    assert.equal(webSocketRelayResponse.status, 200, 'WebSocket relay URLs use the HTTP snapshot origin');
+    assert.deepEqual(await webSocketRelayResponse.json(), { ok: true });
 
     process.env.LLM_API_URL = 'not-a-url';
     process.env.OLLAMA_API_URL = '://also-not-a-url';
-    const malformedResponses = await runProbes('docker', ['LLM_API_URL', 'OLLAMA_API_URL']);
-    for (const [index, envKey] of ['LLM_API_URL', 'OLLAMA_API_URL'].entries()) {
+    process.env.WS_RELAY_URL = 'not-a-relay-url';
+    const malformedKeys = ['LLM_API_URL', 'OLLAMA_API_URL', 'WS_RELAY_URL'];
+    const malformedResponses = await runProbes('docker', malformedKeys);
+    for (const [index, envKey] of malformedKeys.entries()) {
       assert.equal(malformedResponses[index].status, 502, envKey);
       const malformedBody = await malformedResponses[index].json();
       assert.equal(malformedBody.error, 'Local handler error');
@@ -1159,6 +1172,7 @@ test('allows only Docker mode to fetch configured private LLM origins', async ()
     }
     assert.ok(warnings.some((message) => message.includes('LLM_API_URL is not a valid URL')));
     assert.ok(warnings.some((message) => message.includes('OLLAMA_API_URL is not a valid URL')));
+    assert.ok(warnings.some((message) => message.includes('WS_RELAY_URL is not a valid URL')));
   } finally {
     for (const [key, value] of Object.entries(envSnapshot)) {
       if (value === undefined) delete process.env[key];
